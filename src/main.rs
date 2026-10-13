@@ -1,11 +1,13 @@
 #![windows_subsystem = "windows"]
 
 mod hardware;
+mod overlay;
 
 use std::fs;
 use std::time::Instant;
 use eframe::egui;
-use hardware::{parse_jmk_bytes, DpiEffect, HardwareBridge, LedEffect, MacroItem, MouseProfile, PollingRate, DEFAULT_PID_WIRED, DEFAULT_PID_WIRELESS};
+use hardware::{parse_jmk_bytes, DpiEffect, HardwareBridge, HardwareEvent, LedEffect, MacroItem, MouseProfile, PollingRate, DEFAULT_PID_WIRED, DEFAULT_PID_WIRELESS};
+use overlay::OsdController;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -206,11 +208,7 @@ struct RedragonApp {
     // Apply progress worker state
     apply_rx: Option<std::sync::mpsc::Receiver<(f32, String)>>,
     apply_progress: Option<(f32, String)>,
-    // DPI switch floating overlay (toast)
-    dpi_toast_time: Option<Instant>,
-    dpi_toast_stage: usize,
-    dpi_toast_val: u32,
-    dpi_toast_color: egui::Color32,
+    osd: OsdController,
 }
 
 impl RedragonApp {
@@ -227,11 +225,19 @@ impl RedragonApp {
         }
     }
 
+    fn sync_dpi_stages_cache(&self) {
+        if let Some(active) = self.profiles.get(self.active_profile_idx) {
+            let stages: Vec<(u32, [u8; 3])> = active
+                .dpi_stages
+                .iter()
+                .map(|s| (s.x, s.color_rgb))
+                .collect();
+            hardware::update_current_dpi_stages(&stages);
+        }
+    }
+
     fn show_dpi_toast(&mut self, stage: usize, dpi: u32, color_rgb: [u8; 3]) {
-        self.dpi_toast_time = Some(Instant::now());
-        self.dpi_toast_stage = stage;
-        self.dpi_toast_val = dpi;
-        self.dpi_toast_color = egui::Color32::from_rgb(color_rgb[0], color_rgb[1], color_rgb[2]);
+        self.osd.show_dpi(stage, dpi, color_rgb);
     }
 }
 
@@ -276,10 +282,18 @@ impl Default for RedragonApp {
 
         let autostart = is_autostart_enabled();
         let (tray, tray_rx) = build_tray();
-        let bridge = HardwareBridge::new();
+        let osd = OsdController::new();
+        let bridge = HardwareBridge::new(osd.clone());
         let conn = bridge.connected;
         let charg = bridge.is_charging;
         let wire = bridge.is_wireless;
+
+        let initial_stages: Vec<(u32, [u8; 3])> = profiles[0]
+            .dpi_stages
+            .iter()
+            .map(|s| (s.x, s.color_rgb))
+            .collect();
+        hardware::update_current_dpi_stages(&initial_stages);
 
         let mut app = Self {
             bridge,
@@ -309,16 +323,13 @@ impl Default for RedragonApp {
             prev_connected: conn,
             prev_charging: charg,
             prev_wireless: wire,
-            minimize_to_tray: true,
+            minimize_to_tray: false,
             autostart_with_windows: autostart,
             _tray: tray,
             tray_rx,
             apply_rx: None,
             apply_progress: None,
-            dpi_toast_time: None,
-            dpi_toast_stage: 1,
-            dpi_toast_val: 1000,
-            dpi_toast_color: egui::Color32::from_rgb(0, 255, 255),
+            osd,
         };
 
         trim_memory();
@@ -349,6 +360,43 @@ impl Default for RedragonApp {
 
 impl eframe::App for RedragonApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        hardware::set_wake_context(ctx.clone());
+
+        // 0. Process Hardware Push Notifications (Physical DPI buttons / profile switches from mouse)
+        while let Ok(event) = self.bridge.event_rx.try_recv() {
+            match event {
+                HardwareEvent::DpiChanged { stage } => {
+                    let active_profile = &mut self.profiles[self.active_profile_idx];
+                    let stage_clamped = stage.clamp(1, active_profile.dpi_stages.len());
+                    active_profile.current_stage = stage_clamped;
+                    let dpi_val = active_profile
+                        .dpi_stages
+                        .get(stage_clamped.saturating_sub(1))
+                        .map(|s| s.x)
+                        .unwrap_or(1000);
+                    let color = active_profile
+                        .dpi_stages
+                        .get(stage_clamped.saturating_sub(1))
+                        .map(|s| s.color_rgb)
+                        .unwrap_or([0, 255, 255]);
+
+                    self.show_dpi_toast(stage_clamped, dpi_val, color);
+                    self.status_msg = format!("DPI switched to Stage {} ({} DPI)", stage_clamped, dpi_val);
+                    self.add_log(LogLevel::Info, format!("Hardware physical DPI switch: Stage {} ({} DPI)", stage_clamped, dpi_val));
+                    ctx.request_repaint();
+                }
+                HardwareEvent::ProfileChanged { profile } => {
+                    if profile >= 1 && profile <= 5 {
+                        self.active_profile_idx = profile - 1;
+                        self.sync_dpi_stages_cache();
+                        self.status_msg = format!("Profile switched to Profile {}", profile);
+                        self.add_log(LogLevel::Info, format!("Hardware physical profile switch: Profile {}", profile));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+
         // Handle Tray Icon Events
         if let Ok(event) = TrayIconEvent::receiver().try_recv() {
             match event {
@@ -387,15 +435,21 @@ impl eframe::App for RedragonApp {
                 } else if pct >= 1.0 {
                     // Complete
                     self.status_msg = msg.clone();
-                    let active = &self.profiles[self.active_profile_idx];
-                    let current_dpi = active.dpi_stages.get(active.current_stage.saturating_sub(1)).map(|s| s.x).unwrap_or(1000);
+                    let (cur_stage, cur_dpi, led_eff, poll_rate, stage_color) = {
+                        let active = &self.profiles[self.active_profile_idx];
+                        let dpi = active.dpi_stages.get(active.current_stage.saturating_sub(1)).map(|s| s.x).unwrap_or(1000);
+                        let clr = active.dpi_stages.get(active.current_stage.saturating_sub(1)).map(|s| s.color_rgb).unwrap_or([0, 255, 255]);
+                        (active.current_stage, dpi, active.led_effect, active.polling_rate, clr)
+                    };
                     self.add_log(LogLevel::Success, format!(
                         "Profile {} written to mouse EEPROM (LED: {:?}, Polling: {:?}, DPI: {}).",
                         self.active_profile_idx + 1,
-                        active.led_effect,
-                        active.polling_rate,
-                        current_dpi
+                        led_eff,
+                        poll_rate,
+                        cur_dpi
                     ));
+                    self.sync_dpi_stages_cache();
+                    self.show_dpi_toast(cur_stage, cur_dpi, stage_color);
                     self.apply_progress = None;
                     self.apply_rx = None;
                     break;
@@ -417,8 +471,8 @@ impl eframe::App for RedragonApp {
             self.add_log(LogLevel::Info, "Application minimized to system tray notification area.");
         }
 
-        // Automatic background polling of USB bus every 800ms
-        if self.last_poll_time.elapsed().as_millis() > 800 {
+        // Automatic background polling of USB bus every 800ms (paused while applying settings)
+        if self.apply_progress.is_none() && self.last_poll_time.elapsed().as_millis() > 800 {
             self.last_poll_time = std::time::Instant::now();
             self.bridge.detect();
             self.profiles[self.active_profile_idx].battery_percent = self.bridge.battery_percent;
@@ -624,6 +678,7 @@ impl eframe::App for RedragonApp {
                                 if let Ok(json_str) = String::from_utf8(bytes.clone()) {
                                     if let Ok(prof) = serde_json::from_str::<MouseProfile>(&json_str) {
                                         self.profiles[self.active_profile_idx] = prof;
+                                        self.sync_dpi_stages_cache();
                                         self.status_msg = "Profile loaded from JSON!".to_string();
                                         self.add_log(LogLevel::Success, format!("Profile loaded from JSON file: {:?}", path.file_name().unwrap_or_default()));
                                         imported = true;
@@ -632,6 +687,7 @@ impl eframe::App for RedragonApp {
                                 if !imported {
                                     if let Some(loaded_jmk) = parse_jmk_bytes(&bytes) {
                                         self.profiles[self.active_profile_idx] = loaded_jmk;
+                                        self.sync_dpi_stages_cache();
                                         self.status_msg = "Original JMK profile loaded successfully!".to_string();
                                         self.add_log(LogLevel::Success, format!("Original JMK binary profile loaded: {:?}", path.file_name().unwrap_or_default()));
                                         imported = true;
@@ -720,6 +776,7 @@ impl eframe::App for RedragonApp {
 
         // 3. MAIN CENTER WORKSPACE
         let mut switched_dpi_stage = None;
+        let mut switched_profile = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             let active_profile = &mut self.profiles[self.active_profile_idx];
 
@@ -732,7 +789,7 @@ impl eframe::App for RedragonApp {
                     let btn = egui::Button::new(egui::RichText::new(format!("Profile {}", i + 1)).strong())
                         .fill(fill);
                     if ui.add(btn).clicked() {
-                        self.active_profile_idx = i;
+                        switched_profile = Some(i);
                     }
                 }
             });
@@ -1527,13 +1584,18 @@ impl eframe::App for RedragonApp {
             }
         });
 
+        if let Some(i) = switched_profile {
+            self.active_profile_idx = i;
+            self.sync_dpi_stages_cache();
+        }
+
         if let Some((stg, dpi_val, clr)) = switched_dpi_stage {
+            self.sync_dpi_stages_cache();
             self.show_dpi_toast(stg, dpi_val, clr);
             self.add_log(LogLevel::Info, format!("Switched to DPI Stage {} ({} DPI)", stg, dpi_val));
         }
 
-        // 4. FLOATING OVERLAYS (DPI TOAST & APPLY LOADING MODAL)
-        // A) Apply Progress Modal
+        // 4. FLOATING OVERLAYS (APPLY LOADING MODAL)
         if let Some((pct, step_text)) = &self.apply_progress {
             egui::Area::new("apply_progress_modal_area".into())
                 .order(egui::Order::Foreground)
@@ -1568,99 +1630,30 @@ impl eframe::App for RedragonApp {
                         });
                 });
         }
-
-        // B) Floating DPI Switch Overlay (Left-side toast like original OEM)
-        if let Some(toast_start) = self.dpi_toast_time {
-            let elapsed = toast_start.elapsed().as_secs_f32();
-            if elapsed < 2.5 {
-                let alpha = if elapsed > 1.8 {
-                    ((2.5 - elapsed) / 0.7).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                let bg_color = egui::Color32::from_rgba_premultiplied(
-                    (20.0 * alpha) as u8,
-                    (22.0 * alpha) as u8,
-                    (28.0 * alpha) as u8,
-                    (230.0 * alpha) as u8,
-                );
-                let border_color = egui::Color32::from_rgba_premultiplied(
-                    (self.dpi_toast_color.r() as f32 * alpha) as u8,
-                    (self.dpi_toast_color.g() as f32 * alpha) as u8,
-                    (self.dpi_toast_color.b() as f32 * alpha) as u8,
-                    (255.0 * alpha) as u8,
-                );
-
-                egui::Area::new("dpi_toast_overlay".into())
-                    .order(egui::Order::Foreground)
-                    .anchor(egui::Align2::LEFT_CENTER, egui::vec2(24.0, 0.0))
-                    .show(ctx, |ui| {
-                        egui::Frame::none()
-                            .fill(bg_color)
-                            .stroke(egui::Stroke::new(1.5_f32, border_color))
-                            .rounding(8.0)
-                            .inner_margin(16.0)
-                            .shadow(egui::epaint::Shadow {
-                                offset: egui::vec2(0.0, 3.0),
-                                blur: 12.0,
-                                spread: 0.0,
-                                color: egui::Color32::from_black_alpha((160.0 * alpha) as u8),
-                            })
-                            .show(ui, |ui| {
-                                ui.set_width(170.0);
-                                ui.vertical(|ui| {
-                                    ui.horizontal(|ui| {
-                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                                        ui.painter().circle_filled(rect.center(), 5.0, border_color);
-                                        ui.label(
-                                            egui::RichText::new(format!("DPI STAGE {}", self.dpi_toast_stage))
-                                                .size(13.0)
-                                                .strong()
-                                                .color(border_color),
-                                        );
-                                    });
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(format!("{} DPI", self.dpi_toast_val))
-                                            .size(22.0)
-                                            .strong()
-                                            .color(egui::Color32::from_rgba_premultiplied(
-                                                (255.0 * alpha) as u8,
-                                                (255.0 * alpha) as u8,
-                                                (255.0 * alpha) as u8,
-                                                (255.0 * alpha) as u8,
-                                            )),
-                                    );
-                                    ui.add_space(6.0);
-                                    // 5-segment Stage Visualizer
-                                    ui.horizontal(|ui| {
-                                        for s in 1..=5 {
-                                            let (seg_rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 5.0), egui::Sense::hover());
-                                            let seg_color = if s == self.dpi_toast_stage {
-                                                border_color
-                                            } else {
-                                                egui::Color32::from_rgba_premultiplied(
-                                                    (55.0 * alpha) as u8,
-                                                    (60.0 * alpha) as u8,
-                                                    (70.0 * alpha) as u8,
-                                                    (180.0 * alpha) as u8,
-                                                )
-                                            };
-                                            ui.painter().rect_filled(seg_rect, 2.5, seg_color);
-                                        }
-                                    });
-                                });
-                            });
-                    });
-                ctx.request_repaint();
-            } else {
-                self.dpi_toast_time = None;
-            }
-        }
     }
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::w;
+        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+
+        let _mutex = CreateMutexW(None, true, w!("Global\\RedragonM719Pro_SingleInstanceMutex"));
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let window_title = w!("Redragon INVADER PRO (M719RGB-PRO) Suite");
+            if let Ok(existing_hwnd) = FindWindowW(None, window_title) {
+                let _ = ShowWindow(existing_hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(existing_hwnd);
+            }
+            return Ok(());
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 680.0])

@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
+
+pub static IS_APPLYING: AtomicBool = AtomicBool::new(false);
 
 pub const DEFAULT_VID: u16 = 0x25A7;
 pub const DEFAULT_PID_WIRED: u16 = 0xFAB0;
@@ -111,6 +114,12 @@ impl Default for MouseProfile {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum HardwareEvent {
+    DpiChanged { stage: usize },
+    ProfileChanged { profile: usize },
+}
+
 pub struct HardwareBridge {
     pub connected: bool,
     pub is_charging: bool,
@@ -125,6 +134,7 @@ pub struct HardwareBridge {
     pub handshake_ok: bool,
     pub last_status_detail: String,
     hid_api: Option<hidapi::HidApi>,
+    pub event_rx: std::sync::mpsc::Receiver<HardwareEvent>,
 }
 
 // PixArt PAW3325 Hardware DPI tables extracted from OemDrv.exe data segment (DAT_005cd1b8 & DAT_005cd418)
@@ -344,8 +354,135 @@ pub fn send_commit(dev: &hidapi::HidDevice) -> Result<(), hidapi::HidError> {
     dev.send_feature_report(&pkt)
 }
 
+static WAKE_CTX: std::sync::RwLock<Option<eframe::egui::Context>> = std::sync::RwLock::new(None);
+pub static CURRENT_DPI_STAGES: std::sync::RwLock<Vec<(u32, [u8; 3])>> = std::sync::RwLock::new(Vec::new());
+
+pub fn update_current_dpi_stages(stages: &[(u32, [u8; 3])]) {
+    if let Ok(mut lock) = CURRENT_DPI_STAGES.write() {
+        *lock = stages.to_vec();
+    }
+}
+
+pub fn set_wake_context(ctx: eframe::egui::Context) {
+    if let Ok(mut lock) = WAKE_CTX.write() {
+        *lock = Some(ctx);
+    }
+}
+
+// Persistent reader thread on UsagePage 0xFF01 (FUN_004428e0)
+// Listens for asynchronous MCU push events (Cmd 0x0A):
+// - Bit 0 (0x01): Physical DPI button pressed -> buf[7] = stage index (0..4)
+// - Bit 1 (0x02): Profile switch button pressed -> buf[8] = profile index (0..4)
+pub fn start_notification_listener(
+    vid: u16,
+    event_tx: std::sync::mpsc::Sender<HardwareEvent>,
+    osd: crate::overlay::OsdController,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("hid_notify_listener".to_string())
+        .spawn(move || {
+            let mut api_opt = hidapi::HidApi::new().ok();
+            let mut current_dev: Option<hidapi::HidDevice> = None;
+            let mut buf = [0u8; 64];
+
+            loop {
+                // When applying profile to EEPROM, pause to prevent any USB interference
+                if IS_APPLYING.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+
+                if current_dev.is_none() {
+                    if let Some(api) = &mut api_opt {
+                        let _ = api.refresh_devices();
+                        for dev_info in api.device_list() {
+                            if dev_info.vendor_id() == vid && dev_info.usage_page() == 0xFF01 {
+                                if let Ok(d) = dev_info.open_device(api) {
+                                    current_dev = Some(d);
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        api_opt = hidapi::HidApi::new().ok();
+                    }
+
+                    if current_dev.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                        continue;
+                    }
+                }
+
+                if let Some(dev) = &current_dev {
+                    match dev.read_timeout(&mut buf, 150) {
+                        Ok(n) if n >= 8 => {
+                            let (cmd, flags, dpi_raw, prof_raw) = if buf[1] == 0x0A {
+                                (buf[1], buf[6], buf[7], buf[8])
+                            } else if buf[0] == 0x0A {
+                                (buf[0], buf[5], buf[6], buf[7])
+                            } else if buf[0] == 0x09 {
+                                (buf[1], buf[6], buf[7], buf[8])
+                            } else {
+                                (0, 0, 0, 0)
+                            };
+
+                            if cmd == 0x0A {
+                                // Bit 0 (0x01): DPI level changed
+                                if flags & 0x01 != 0 {
+                                    let stage = ((dpi_raw & 0x0F) as usize) + 1;
+
+                                    // Look up active DPI value and color from cache
+                                    let (dpi_val, color) = if let Ok(lock) = CURRENT_DPI_STAGES.read() {
+                                        if let Some(&(val, clr)) = lock.get(stage.saturating_sub(1)) {
+                                            (val, clr)
+                                        } else {
+                                            (stage as u32 * 1000, [0, 255, 255])
+                                        }
+                                    } else {
+                                        (1000, [0, 255, 255])
+                                    };
+
+                                    // 1. Instantly trigger native desktop Win32 OSD overlay on screen!
+                                    osd.show_dpi(stage, dpi_val, color);
+
+                                    // 2. Notify UI thread to update slider and logs
+                                    let _ = event_tx.send(HardwareEvent::DpiChanged { stage });
+                                    if let Ok(lock) = WAKE_CTX.read() {
+                                        if let Some(ctx) = &*lock {
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                                // Bit 1 (0x02): Profile switch
+                                if flags & 0x02 != 0 {
+                                    let profile = ((prof_raw & 0x0F) as usize) + 1;
+                                    let _ = event_tx.send(HardwareEvent::ProfileChanged { profile });
+                                    if let Ok(lock) = WAKE_CTX.read() {
+                                        if let Some(ctx) = &*lock {
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            // normal read timeout, keep listening
+                        }
+                        Err(_) => {
+                            // Device disconnected or asleep
+                            current_dev = None;
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                    }
+                }
+            }
+        })
+        .expect("Failed to spawn hid_notify_listener thread")
+}
+
 impl HardwareBridge {
-    pub fn new() -> Self {
+    pub fn new(osd: crate::overlay::OsdController) -> Self {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
         let mut bridge = Self {
             connected: false,
             is_charging: false,
@@ -359,16 +496,22 @@ impl HardwareBridge {
             handshake_ok: false,
             last_status_detail: String::new(),
             hid_api: hidapi::HidApi::new().ok(),
+            event_rx,
         };
         bridge.detect();
+        start_notification_listener(DEFAULT_VID, event_tx, osd);
         bridge
     }
 
     pub fn detect(&mut self) -> bool {
+        if IS_APPLYING.load(Ordering::SeqCst) {
+            return self.connected;
+        }
+
         let mut found_wired = false;
         let mut found_dongle = false;
         let mut mouse_responsive = false;
-        let mut handshake_passed = false;
+        let mut handshake_passed = self.handshake_ok;
         let mut live_battery = 0u8;
 
         if self.hid_api.is_none() {
@@ -396,7 +539,7 @@ impl HardwareBridge {
                     if device.usage_page() == 0xFF02 && dev_cmd.is_none() {
                         dev_cmd = device.open_device(api).ok();
                     }
-                    if device.usage_page() == 0xFF01 && dev_notify.is_none() {
+                    if !self.handshake_ok && device.usage_page() == 0xFF01 && dev_notify.is_none() {
                         dev_notify = device.open_device(api).ok();
                     }
 
@@ -421,49 +564,63 @@ impl HardwareBridge {
 
             // Real Hardware Handshake & Connection Verification
             if found_dongle {
-                if let (Some(cmd), Some(notify)) = (&dev_cmd, &dev_notify) {
-                    let mut pkt = [0u8; 17];
-                    pkt[0] = 0x08;
-                    pkt[1] = 0x03; // GetConnectStatus
-                    pkt[16] = calc_packet_checksum(&pkt); // Exact checksum: 0x4A
+                if !self.handshake_ok {
+                    if let (Some(cmd), Some(notify)) = (&dev_cmd, &dev_notify) {
+                        let mut pkt = [0u8; 17];
+                        pkt[0] = 0x08;
+                        pkt[1] = 0x03; // GetConnectStatus
+                        pkt[16] = calc_packet_checksum(&pkt); // Exact checksum: 0x4A
 
-                    for _ in 0..3 {
-                        if cmd.send_feature_report(&pkt).is_ok() {
-                            let mut buf = [0u8; 64];
-                            if let Ok(n) = notify.read_timeout(&mut buf, 100) {
-                                if n >= 3 && buf[0] == 0x09 && buf[1] == 0x03 {
-                                    if (n >= 7 && (buf[5] != 0 || buf[6] != 0)) || live_battery > 0 {
-                                        mouse_responsive = true;
-                                        break;
+                        for _ in 0..3 {
+                            if cmd.send_feature_report(&pkt).is_ok() {
+                                let mut buf = [0u8; 64];
+                                if let Ok(n) = notify.read_timeout(&mut buf, 100) {
+                                    if n >= 3 && buf[0] == 0x09 && buf[1] == 0x03 {
+                                        if (n >= 7 && (buf[5] != 0 || buf[6] != 0)) || live_battery > 0 {
+                                            mouse_responsive = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
+                            std::thread::sleep(std::time::Duration::from_millis(15));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(15));
-                    }
 
-                    if mouse_responsive {
-                        // Authentic challenge/response handshake (Cmd 0x01)
+                        if mouse_responsive {
+                            // Authentic challenge/response handshake (Cmd 0x01) - only on initial auth
+                            if perform_handshake(cmd, notify) {
+                                handshake_passed = true;
+                                let _ = send_tell_drv_status(cmd);
+                            }
+                        }
+                    }
+                } else {
+                    // Already authenticated and connected: keep responsive as long as dongle is present
+                    mouse_responsive = true;
+                    handshake_passed = true;
+                }
+            } else if found_wired {
+                mouse_responsive = true;
+                if !self.handshake_ok {
+                    if let (Some(cmd), Some(notify)) = (&dev_cmd, &dev_notify) {
                         if perform_handshake(cmd, notify) {
                             handshake_passed = true;
                             let _ = send_tell_drv_status(cmd);
                         }
                     }
-                }
-            } else if found_wired {
-                mouse_responsive = true;
-                if let (Some(cmd), Some(notify)) = (&dev_cmd, &dev_notify) {
-                    if perform_handshake(cmd, notify) {
-                        handshake_passed = true;
-                        let _ = send_tell_drv_status(cmd);
-                    }
+                } else {
+                    handshake_passed = true;
                 }
             }
         }
 
         self.found_dongle = found_dongle;
         self.found_wired = found_wired;
-        self.handshake_ok = handshake_passed || mouse_responsive;
+        self.handshake_ok = handshake_passed;
+
+        if !found_dongle && !found_wired {
+            self.handshake_ok = false;
+        }
 
         if live_battery > 0 {
             self.battery_percent = live_battery;
@@ -516,6 +673,13 @@ impl HardwareBridge {
     }
 
     pub fn apply_profile_direct<F: Fn(f32, &str)>(vid: u16, profile: &MouseProfile, profile_index: usize, on_progress: F) -> Result<(), String> {
+        IS_APPLYING.store(true, Ordering::SeqCst);
+        let res = Self::apply_profile_direct_inner(vid, profile, profile_index, on_progress);
+        IS_APPLYING.store(false, Ordering::SeqCst);
+        res
+    }
+
+    fn apply_profile_direct_inner<F: Fn(f32, &str)>(vid: u16, profile: &MouseProfile, profile_index: usize, on_progress: F) -> Result<(), String> {
         const SPEED_LUT: [u8; 10] = [0xFF, 0xE6, 0xD2, 0xBE, 0xAA, 0x96, 0x82, 0x6E, 0x46, 0x28];
         const NEON_SPEED_LUT: [u8; 10] = [0x2D, 0x28, 0x23, 0x1E, 0x19, 0x13, 0x0F, 0x0A, 0x05, 0x03];
         const BRIGHTNESS_LUT: [u8; 10] = [0x19, 0x32, 0x4B, 0x64, 0x7D, 0x96, 0xAF, 0xC8, 0xE1, 0xFF];
@@ -538,46 +702,102 @@ impl HardwareBridge {
                     // PRIMARY EEPROM SYNC VIA USAGE PAGE 0xFF02 (Report 0x08)
                     if dev_info.usage_page() == 0xFF02 {
                         if let Ok(dev) = dev_info.open_device(&api) {
-                            // 1. Button Matrix (EEPROM Addr 0x0060..0x009F, written in chunks)
+                            // 1. Button Matrix (EEPROM Addr 0x0060..0x009F, 16 slots of 4 bytes each)
+                            // Authentic layout verified against Wireshark OEM PCAP (frames 1575-1603):
+                            // Slot 0 (0x60): Left (01 01 00 53)
+                            // Slot 1 (0x64): Right (01 02 00 52)
+                            // Slot 2 (0x68): Middle (01 04 00 50)
+                            // Slot 3 (0x6C): Back (01 08 00 4C)
+                            // Slot 4 (0x70): Forward (01 10 00 44)
+                            // Slot 6 (0x78): Rapid Fire (09 00 00 4C)
+                            // Slot 8 (0x80): OEM reserved hardware parameter (06 08 FE 49)
+                            // Slot 10 (0x88): DPI + (02 02 00 51)
+                            // Slot 11 (0x8C): DPI - (02 03 00 50)
                             on_progress(0.15, "Writing Hardware Button Matrix...");
-                            for (idx, b_action) in profile.button_actions.iter().enumerate().take(8) {
+                            let mut matrix = [0u8; 64];
+                            for k in 0..16 {
+                                matrix[k * 4] = 0x00;
+                                matrix[k * 4 + 1] = 0x00;
+                                matrix[k * 4 + 2] = 0x00;
+                                matrix[k * 4 + 3] = 0x55;
+                            }
+                            // Slot 8 is essential hardware mouse parameter
+                            matrix[8 * 4] = 0x06;
+                            matrix[8 * 4 + 1] = 0x08;
+                            matrix[8 * 4 + 2] = 0xFE;
+                            matrix[8 * 4 + 3] = 0x49;
+
+                            const BUTTON_SLOT_MAP: [usize; 8] = [
+                                0,  // Button 1: Left Click (0x0060)
+                                1,  // Button 2: Right Click (0x0064)
+                                2,  // Button 3: Middle Wheel (0x0068)
+                                4,  // Button 4: Forward (0x0070)
+                                3,  // Button 5: Back (0x006C)
+                                6,  // Button 6: Rapid Fire (0x0078)
+                                10, // Button 7: DPI + (0x0088)
+                                11, // Button 8: DPI - (0x008C)
+                            ];
+
+                            for (btn_idx, b_action) in profile.button_actions.iter().enumerate().take(8) {
+                                let slot = BUTTON_SLOT_MAP[btn_idx];
                                 let (b0, b1, b2): (u8, u8, u8) = match b_action.as_str() {
                                     "Left button" => (0x01, 0x01, 0x00),
                                     "Right button" => (0x01, 0x02, 0x00),
                                     "Middle button" => (0x01, 0x04, 0x00),
                                     "Forward" => (0x01, 0x10, 0x00),
                                     "Back" => (0x01, 0x08, 0x00),
-                                    "Fire key" => (0x07, 0x00, 0x00),
-                                    "DPI +" => (0x04, 0x32, 0x02),
-                                    "DPI -" => (0x04, 0x32, 0x03),
+                                    "Fire key" | "Rapid Fire" => (0x09, 0x00, 0x00),
+                                    "DPI +" => (0x02, 0x02, 0x00),
+                                    "DPI -" => (0x02, 0x03, 0x00),
                                     "RGB ON/OFF" | "RGB Switch" => (0x04, 0x32, 0x05),
-                                    "Disable" => (0x05, 0x00, 0x00),
-                                    _ => (0x01, 0x01, 0x00),
+                                    "Disable" => (0x00, 0x00, 0x00),
+                                    _ => match btn_idx {
+                                        0 => (0x01, 0x01, 0x00),
+                                        1 => (0x01, 0x02, 0x00),
+                                        2 => (0x01, 0x04, 0x00),
+                                        3 => (0x01, 0x10, 0x00),
+                                        4 => (0x01, 0x08, 0x00),
+                                        5 => (0x09, 0x00, 0x00),
+                                        6 => (0x02, 0x02, 0x00),
+                                        7 => (0x02, 0x03, 0x00),
+                                        _ => (0x00, 0x00, 0x00),
+                                    },
                                 };
                                 let btn_chk = (0x55u8).wrapping_sub(b0.wrapping_add(b1).wrapping_add(b2));
-                                let btn_chunk = [b0, b1, b2, btn_chk];
-                                let btn_addr = 0x0060 + (idx as u16 * 4);
-                                let _ = write_mouse_eeprom(&dev, btn_addr, &btn_chunk);
+                                matrix[slot * 4] = b0;
+                                matrix[slot * 4 + 1] = b1;
+                                matrix[slot * 4 + 2] = b2;
+                                matrix[slot * 4 + 3] = btn_chk;
+                            }
+                            for chunk_idx in 0..8 {
+                                let chunk_addr = 0x0060 + (chunk_idx * 8) as u16;
+                                let chunk_data = &matrix[chunk_idx * 8..(chunk_idx + 1) * 8];
+                                let _ = write_mouse_eeprom(&dev, chunk_addr, chunk_data);
                             }
                             std::thread::sleep(std::time::Duration::from_millis(15));
 
-                            // 2. DPI Stage Values (EEPROM Addr 0x000C + 4*i, 4 bytes each [x_code, y_code, hi_range, chk])
+                            // 2. DPI Stage Values (EEPROM Addr 0x000C, 20 bytes in chunks of 8, 8, 4 bytes)
                             // Uses PixArt PAW3325 lookup code table
                             on_progress(0.30, "Calibrating Sensor DPI Stages...");
+                            let mut dpi_stages_data = [0u8; 20];
                             for (idx, stage) in profile.dpi_stages.iter().enumerate().take(5) {
                                 let (x_code, hi_range_x) = dpi_to_paw3325_code(stage.x);
                                 let (y_code, _) = dpi_to_paw3325_code(stage.y);
                                 let hi_byte = if hi_range_x { 0x01 } else { 0x00 };
                                 let stage_sum = x_code.wrapping_add(y_code).wrapping_add(hi_byte);
                                 let stage_chk = (0x55u8).wrapping_sub(stage_sum);
-                                let stage_chunk = [x_code, y_code, hi_byte, stage_chk];
-                                let stage_addr = 0x000C + (idx as u16 * 4);
-                                let _ = write_mouse_eeprom(&dev, stage_addr, &stage_chunk);
+                                let off = idx * 4;
+                                dpi_stages_data[off] = x_code;
+                                dpi_stages_data[off + 1] = y_code;
+                                dpi_stages_data[off + 2] = hi_byte;
+                                dpi_stages_data[off + 3] = stage_chk;
                             }
+                            let _ = write_mouse_eeprom(&dev, 0x000C, &dpi_stages_data[0..8]);
+                            let _ = write_mouse_eeprom(&dev, 0x0014, &dpi_stages_data[8..16]);
+                            let _ = write_mouse_eeprom(&dev, 0x001C, &dpi_stages_data[16..20]);
                             std::thread::sleep(std::time::Duration::from_millis(15));
 
                             // 3. Active DPI Stage Count (EEPROM Addr 0x0002, 2 bytes)
-                            // Note: OEM writes total active stage count (e.g. 05 50)
                             on_progress(0.45, "Writing DPI stage configuration count...");
                             let active_count: u8 = profile.dpi_stages.iter().take(5).filter(|s| s.enabled).count() as u8;
                             let count_byte = if active_count == 0 { 5 } else { active_count };
@@ -585,18 +805,24 @@ impl HardwareBridge {
                             let _ = write_mouse_eeprom(&dev, 0x0002, &[count_byte, count_chk]);
                             std::thread::sleep(std::time::Duration::from_millis(15));
 
-                            // 4. DPI Stage Indicator Colors (EEPROM Addr 0x002C + 4*i, 4 bytes each [R, G, B, chk])
+                            // 4. DPI Stage Indicator Colors (EEPROM Addr 0x002C, 20 bytes in chunks of 8, 8, 4 bytes)
                             on_progress(0.60, "Writing DPI Stage Color Indicators...");
+                            let mut dpi_colors_data = [0u8; 20];
                             for (idx, stage) in profile.dpi_stages.iter().enumerate().take(5) {
                                 let r = stage.color_rgb[0];
                                 let g = stage.color_rgb[1];
                                 let b = stage.color_rgb[2];
                                 let color_sum = r.wrapping_add(g).wrapping_add(b);
                                 let color_chk = (0x55u8).wrapping_sub(color_sum);
-                                let color_chunk = [r, g, b, color_chk];
-                                let color_addr = 0x002C + (idx as u16 * 4);
-                                let _ = write_mouse_eeprom(&dev, color_addr, &color_chunk);
+                                let off = idx * 4;
+                                dpi_colors_data[off] = r;
+                                dpi_colors_data[off + 1] = g;
+                                dpi_colors_data[off + 2] = b;
+                                dpi_colors_data[off + 3] = color_chk;
                             }
+                            let _ = write_mouse_eeprom(&dev, 0x002C, &dpi_colors_data[0..8]);
+                            let _ = write_mouse_eeprom(&dev, 0x0034, &dpi_colors_data[8..16]);
+                            let _ = write_mouse_eeprom(&dev, 0x003C, &dpi_colors_data[16..20]);
                             std::thread::sleep(std::time::Duration::from_millis(15));
 
                             // 5. Main RGB Lighting (EEPROM Addr 0x00A0, 7 bytes: [effect, R, G, B, speed, brightness, chk])
@@ -798,6 +1024,15 @@ pub fn parse_jmk_bytes(bytes: &[u8]) -> Option<MouseProfile> {
     let mut profile = MouseProfile::default();
     let prof_offset = 0;
 
+    // Active stage index from +0x09F0
+    let cur_stg_offset = prof_offset + 0x09F0;
+    if cur_stg_offset + 4 <= bytes.len() {
+        let cur_stg = u32::from_le_bytes(bytes[cur_stg_offset..cur_stg_offset+4].try_into().unwrap_or([0,0,0,0]));
+        if cur_stg >= 1 && cur_stg <= 5 {
+            profile.current_stage = cur_stg as usize;
+        }
+    }
+
     for (i, stage) in profile.dpi_stages.iter_mut().enumerate().take(5) {
         let stage_base = prof_offset + 0x0A08 + (i * 16);
         if stage_base + 16 <= bytes.len() {
@@ -806,9 +1041,12 @@ pub fn parse_jmk_bytes(bytes: &[u8]) -> Option<MouseProfile> {
             if x >= 100 && x <= 10000 {
                 stage.x = x;
                 stage.y = y;
+                stage.enabled = true;
             }
             stage.color_rgb = [bytes[stage_base+8], bytes[stage_base+9], bytes[stage_base+10]];
-            stage.enabled = bytes[stage_base+12] != 0;
+            if bytes[stage_base+12] != 0 {
+                stage.enabled = true;
+            }
         }
     }
 
