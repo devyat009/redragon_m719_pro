@@ -127,6 +127,52 @@ pub struct HardwareBridge {
     hid_api: Option<hidapi::HidApi>,
 }
 
+// PixArt PAW3325 Hardware DPI tables extracted from OemDrv.exe data segment (DAT_005cd1b8 & DAT_005cd418)
+pub const PAW3325_DPI_TABLE: [u32; 49] = [
+    200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700,
+    1800, 1900, 2000, 2100, 2200, 2300, 2400, 2500, 2600, 2700, 2800, 2900, 3000, 3100, 3200,
+    3300, 3400, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200, 4300, 4400, 4500, 4600, 4700,
+    4800, 4900, 5000,
+];
+
+pub const PAW3325_CODE_TABLE: [u8; 49] = [
+    0x04, 0x06, 0x08, 0x0B, 0x0D, 0x0F, 0x12, 0x14, 0x16, 0x19, 0x1B, 0x1D, 0x20, 0x22, 0x24,
+    0x27, 0x29, 0x2B, 0x2E, 0x30, 0x32, 0x34, 0x37, 0x39, 0x3B, 0x3E, 0x40, 0x42, 0x45, 0x47,
+    0x49, 0x4C, 0x4E, 0x50, 0x53, 0x55, 0x57, 0x5A, 0x5C, 0x5E, 0x61, 0x63, 0x65, 0x68, 0x6A,
+    0x6C, 0x6F, 0x71, 0x73,
+];
+
+pub fn dpi_to_paw3325_code(dpi: u32) -> (u8, bool) {
+    let hi_range = dpi > 5000;
+    let effective_dpi = if hi_range { dpi / 2 } else { dpi };
+
+    // Find closest entry in PAW3325 table
+    let mut best_idx = 0;
+    let mut min_diff = u32::MAX;
+    for (i, &table_dpi) in PAW3325_DPI_TABLE.iter().enumerate() {
+        let diff = if table_dpi > effective_dpi {
+            table_dpi - effective_dpi
+        } else {
+            effective_dpi - table_dpi
+        };
+        if diff < min_diff {
+            min_diff = diff;
+            best_idx = i;
+        }
+    }
+    (PAW3325_CODE_TABLE[best_idx], hi_range)
+}
+
+pub fn paw3325_code_to_dpi(code: u8, hi_range: bool) -> u32 {
+    for (i, &table_code) in PAW3325_CODE_TABLE.iter().enumerate() {
+        if table_code == code {
+            let base = PAW3325_DPI_TABLE[i];
+            return if hi_range { base * 2 } else { base };
+        }
+    }
+    1000
+}
+
 // Calculate the 17-byte HID Feature Report packet checksum used by the MCU firmware.
 // The MCU requires: (sum(pkt[0..15]) + pkt[16]) & 0xFF == 0x55.
 pub fn calc_packet_checksum(pkt: &[u8; 17]) -> u8 {
@@ -147,24 +193,155 @@ fn send_mouse_cmd(dev: &hidapi::HidDevice, cmd_id: u8, data: u8) -> Result<(), h
     dev.send_feature_report(&pkt)
 }
 
-// Writes a chunk to mouse EEPROM via Report 0x08 on UsagePage 0xFF02.
-// Chunks up to 10 bytes (0x0A) per packet as required by the OEM MCU protocol.
-fn write_mouse_eeprom(dev: &hidapi::HidDevice, addr: u16, data: &[u8]) -> Result<(), hidapi::HidError> {
-    for (chunk_idx, chunk) in data.chunks(10).enumerate() {
-        let chunk_addr = addr + (chunk_idx * 10) as u16;
+// Performs the authentic OEM Challenge/Response handshake (Cmd 0x01) with the mouse MCU.
+// Algorithm from FUN_004431b0:
+// Generates 4 random bytes r[0..3] (1..100).
+// Secret key k = [1, 0, 0, 0] (default from DAT_005da8f4..f7).
+// Expected reply:
+//   expect[0] = k0 + r1 + r0
+//   expect[1] = k1 + r2 + 2*r1
+//   expect[2] = k2 + r3 + 3*r2
+//   expect[3] = k3 + r0 + 4*r3
+// Expected reply:
+//   expect[0] = k0 + r1 + r0
+//   expect[1] = k1 + r2 + 2*r1
+//   expect[2] = k2 + r3 + 3*r2
+//   expect[3] = k3 + r0 + 4*r3
+// Packet: [0x08, 0x01, 0x00, 0x00, 0x00, 0x04, r0, r1, r2, r3, 0, 0, 0, 0, 0, 0, chk]
+// Verified from Wireshark PCAP (Frame 489/491): Secret key PD = [0x05, 0x00, 0x00, 0x00].
+// Reads reply on notify endpoint (Report 0x09) and verifies bytes match expect[].
+pub fn perform_handshake(cmd_dev: &hidapi::HidDevice, notify_dev: &hidapi::HidDevice) -> bool {
+    let k = [0x05u8, 0x00u8, 0x00u8, 0x00u8]; // Solved secret key PD from live Wireshark USB trace
+
+    for _attempt in 0..5 {
+        use std::time::SystemTime;
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let r0 = ((nanos & 0xFF) % 100 + 1) as u8;
+        let r1 = (((nanos >> 8) & 0xFF) % 100 + 1) as u8;
+        let r2 = (((nanos >> 16) & 0xFF) % 100 + 1) as u8;
+        let r3 = (((nanos >> 24) & 0xFF) % 100 + 1) as u8;
+
+        let exp0 = k[0].wrapping_add(r1).wrapping_add(r0);
+        let exp1 = k[1].wrapping_add(r2).wrapping_add(2u8.wrapping_mul(r1));
+        let exp2 = k[2].wrapping_add(r3).wrapping_add(3u8.wrapping_mul(r2));
+        let exp3 = k[3].wrapping_add(r0).wrapping_add(4u8.wrapping_mul(r3));
+
         let mut pkt = [0u8; 17];
-        pkt[0] = 0x08; // Report ID 0x08
-        pkt[1] = 0x07; // Command 0x07: Write EEPROM
-        pkt[2] = (chunk_addr >> 8) as u8;
-        pkt[3] = (chunk_addr & 0xFF) as u8;
-        pkt[4] = chunk.len() as u8;
-        pkt[5..5 + chunk.len()].copy_from_slice(chunk);
-        // Byte 16 is the packet checksum over pkt[0..15]
+        pkt[0] = 0x08; // Report 0x08
+        pkt[1] = 0x01; // Cmd 0x01 Handshake
+        pkt[2] = 0x00; // Sub-op
+        pkt[3] = 0x00;
+        pkt[4] = 0x00;
+        pkt[5] = 0x04; // length 4
+        pkt[6] = r0;
+        pkt[7] = r1;
+        pkt[8] = r2;
+        pkt[9] = r3;
         pkt[16] = calc_packet_checksum(&pkt);
-        dev.send_feature_report(&pkt)?;
-        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        if cmd_dev.send_feature_report(&pkt).is_ok() {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = notify_dev.read_timeout(&mut buf, 80) {
+                // Reply is Report 0x09, cmd 0x01 in buf[1], with return bytes in buf[6..10]
+                if n >= 10 && buf[0] == 0x09 && buf[1] == 0x01 {
+                    if buf[6] == exp0 && buf[7] == exp1 && buf[8] == exp2 && buf[9] == exp3 {
+                        return true;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
     }
+    false
+}
+
+// Reads up to 10 bytes from mouse EEPROM via Cmd 0x08 on UsagePage 0xFF02 (FUN_004438f0).
+// Packet layout verified from PCAP Frame 493: [0x08, 0x08, 0x00, addr_hi, addr_lo, len, ...]
+pub fn read_mouse_eeprom(cmd_dev: &hidapi::HidDevice, notify_dev: &hidapi::HidDevice, addr: u16, len: u8) -> Result<Vec<u8>, String> {
+    let chunk_len = len.min(10);
+    let mut pkt = [0u8; 17];
+    pkt[0] = 0x08;
+    pkt[1] = 0x08; // Cmd 0x08: Read EEPROM
+    pkt[2] = 0x00; // Sub-op / pad
+    pkt[3] = (addr >> 8) as u8;
+    pkt[4] = (addr & 0xFF) as u8;
+    pkt[5] = chunk_len;
+    pkt[16] = calc_packet_checksum(&pkt);
+
+    cmd_dev.send_feature_report(&pkt).map_err(|e| e.to_string())?;
+
+    let mut buf = [0u8; 64];
+    for _ in 0..5 {
+        if let Ok(n) = notify_dev.read_timeout(&mut buf, 80) {
+            if n >= 6 + (chunk_len as usize) && buf[0] == 0x09 && buf[1] == 0x08 {
+                return Ok(buf[6..6 + (chunk_len as usize)].to_vec());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err("ReadEEPROM timeout".to_string())
+}
+
+// Writes arbitrary data to mouse EEPROM via Cmd 0x07 in up to 10-byte chunks (FUN_004435d0)
+// Packet layout verified from PCAP Frame 1555/1575: [0x08, 0x07, 0x00, addr_hi, addr_lo, len, data..., chk]
+pub fn write_mouse_eeprom(dev: &hidapi::HidDevice, addr: u16, data: &[u8]) -> Result<(), hidapi::HidError> {
+    let mut offset = 0;
+    let mut current_addr = addr;
+
+    while offset < data.len() {
+        let chunk_size = std::cmp::min(10, data.len() - offset);
+        let mut pkt = [0u8; 17];
+        pkt[0] = 0x08; // Report ID
+        pkt[1] = 0x07; // Cmd 0x07: Write EEPROM
+        pkt[2] = 0x00; // Sub-op / pad
+        pkt[3] = (current_addr >> 8) as u8;
+        pkt[4] = (current_addr & 0xFF) as u8;
+        pkt[5] = chunk_size as u8;
+
+        for i in 0..chunk_size {
+            pkt[6 + i] = data[offset + i];
+        }
+
+        pkt[16] = calc_packet_checksum(&pkt);
+
+        dev.send_feature_report(&pkt)?;
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        offset += chunk_size;
+        current_addr += chunk_size as u16;
+    }
+
     Ok(())
+}
+
+// Cmd 0x02: TellDrvStatus (FUN_004434b0 -> FUN_00443050(2, status))
+// Verified from PCAP Frame 497: buf[2..5] = 00 00 00 01, buf[6..9] = 01 00 00 00
+pub fn send_tell_drv_status(dev: &hidapi::HidDevice) -> Result<(), hidapi::HidError> {
+    let mut pkt = [0u8; 17];
+    pkt[0] = 0x08;
+    pkt[1] = 0x02; // Cmd 0x02 TellDrvStatus
+    pkt[2] = 0x00;
+    pkt[3] = 0x00;
+    pkt[4] = 0x00;
+    pkt[5] = 0x01;
+    pkt[6] = 0x01; // status online
+    pkt[7] = 0x00;
+    pkt[8] = 0x00;
+    pkt[9] = 0x00;
+    pkt[16] = calc_packet_checksum(&pkt);
+    dev.send_feature_report(&pkt)
+}
+
+// Cmd 0x09: Commit Apply (FUN_00443050(9, 0)) - Note: Not sent during standard Apply in live PCAP
+pub fn send_commit(dev: &hidapi::HidDevice) -> Result<(), hidapi::HidError> {
+    let mut pkt = [0u8; 17];
+    pkt[0] = 0x08;
+    pkt[1] = 0x09; // Cmd 0x09 Commit
+    pkt[16] = calc_packet_checksum(&pkt);
+    dev.send_feature_report(&pkt)
 }
 
 impl HardwareBridge {
@@ -191,6 +368,7 @@ impl HardwareBridge {
         let mut found_wired = false;
         let mut found_dongle = false;
         let mut mouse_responsive = false;
+        let mut handshake_passed = false;
         let mut live_battery = 0u8;
 
         if self.hid_api.is_none() {
@@ -241,9 +419,9 @@ impl HardwareBridge {
                 }
             }
 
-            // Real Hardware Handshake: Verify if the mouse is physically switched ON and responsive
+            // Real Hardware Handshake & Connection Verification
             if found_dongle {
-                if let (Some(cmd), Some(notify)) = (dev_cmd, dev_notify) {
+                if let (Some(cmd), Some(notify)) = (&dev_cmd, &dev_notify) {
                     let mut pkt = [0u8; 17];
                     pkt[0] = 0x08;
                     pkt[1] = 0x03; // GetConnectStatus
@@ -263,13 +441,29 @@ impl HardwareBridge {
                         }
                         std::thread::sleep(std::time::Duration::from_millis(15));
                     }
+
+                    if mouse_responsive {
+                        // Authentic challenge/response handshake (Cmd 0x01)
+                        if perform_handshake(cmd, notify) {
+                            handshake_passed = true;
+                            let _ = send_tell_drv_status(cmd);
+                        }
+                    }
+                }
+            } else if found_wired {
+                mouse_responsive = true;
+                if let (Some(cmd), Some(notify)) = (&dev_cmd, &dev_notify) {
+                    if perform_handshake(cmd, notify) {
+                        handshake_passed = true;
+                        let _ = send_tell_drv_status(cmd);
+                    }
                 }
             }
         }
 
         self.found_dongle = found_dongle;
         self.found_wired = found_wired;
-        self.handshake_ok = mouse_responsive;
+        self.handshake_ok = handshake_passed || mouse_responsive;
 
         if live_battery > 0 {
             self.battery_percent = live_battery;
@@ -323,6 +517,7 @@ impl HardwareBridge {
 
     pub fn apply_profile_direct<F: Fn(f32, &str)>(vid: u16, profile: &MouseProfile, profile_index: usize, on_progress: F) -> Result<(), String> {
         const SPEED_LUT: [u8; 10] = [0xFF, 0xE6, 0xD2, 0xBE, 0xAA, 0x96, 0x82, 0x6E, 0x46, 0x28];
+        const NEON_SPEED_LUT: [u8; 10] = [0x2D, 0x28, 0x23, 0x1E, 0x19, 0x13, 0x0F, 0x0A, 0x05, 0x03];
         const BRIGHTNESS_LUT: [u8; 10] = [0x19, 0x32, 0x4B, 0x64, 0x7D, 0x96, 0xAF, 0xC8, 0xE1, 0xFF];
 
         let mut delivered = false;
@@ -343,85 +538,8 @@ impl HardwareBridge {
                     // PRIMARY EEPROM SYNC VIA USAGE PAGE 0xFF02 (Report 0x08)
                     if dev_info.usage_page() == 0xFF02 {
                         if let Ok(dev) = dev_info.open_device(&api) {
-                            // 1. Set USB Polling Rate (EEPROM Addr 0x0000, 2 bytes)
-                            on_progress(0.15, "Writing USB Polling Rate...");
-                            let rate_chk = (0x55u8).wrapping_sub(rate_hw_byte);
-                            let rate_data = [rate_hw_byte, rate_chk];
-                            let _ = write_mouse_eeprom(&dev, 0x0000, &rate_data);
-                            std::thread::sleep(std::time::Duration::from_millis(30));
-
-                            // 2. Set Main RGB Lighting (EEPROM Addr 0x00A0, 7 bytes)
-                            on_progress(0.35, "Syncing RGB Lighting & Effects...");
-                            let spd_idx = (profile.led_speed.clamp(1, 10) - 1) as usize;
-                            let bri_idx = (profile.led_brightness.clamp(1, 10) - 1) as usize;
-                            let hw_spd = SPEED_LUT[spd_idx];
-                            let (hw_effect, hw_bri) = match profile.led_effect {
-                                LedEffect::Steady => (0x02, BRIGHTNESS_LUT[bri_idx]),
-                                LedEffect::Respiration => (0x01, BRIGHTNESS_LUT[bri_idx]),
-                                LedEffect::Neon => (0x03, BRIGHTNESS_LUT[bri_idx]),
-                                LedEffect::Streaming => (0x04, BRIGHTNESS_LUT[bri_idx]),
-                                LedEffect::Off => (0x04, 0x00),
-                            };
-
-                            let mut main_rgb = [0u8; 7];
-                            main_rgb[0] = profile.led_color[0]; // Red
-                            main_rgb[1] = profile.led_color[1]; // Green
-                            main_rgb[2] = profile.led_color[2]; // Blue
-                            main_rgb[3] = hw_spd;               // Speed LUT
-                            main_rgb[4] = hw_effect;            // Effect hardware code
-                            main_rgb[5] = hw_bri;               // Brightness LUT
-                            let mut rgb_sum = 0u8;
-                            for b in &main_rgb[0..6] {
-                                rgb_sum = rgb_sum.wrapping_add(*b);
-                            }
-                            main_rgb[6] = (0x55u8).wrapping_sub(rgb_sum);
-                            let _ = write_mouse_eeprom(&dev, 0x00A0, &main_rgb);
-                            std::thread::sleep(std::time::Duration::from_millis(30));
-
-                            // 3. Set DPI Stages & Active Stage (EEPROM Addr 0x0054, 8 bytes)
-                            on_progress(0.55, "Calibrating Sensor DPI Stages...");
-                            let mut dpi_stages_data = [0u8; 8];
-                            for (idx, stage) in profile.dpi_stages.iter().enumerate().take(5) {
-                                dpi_stages_data[idx] = (stage.x / 100).clamp(1, 100) as u8;
-                            }
-                            dpi_stages_data[5] = (profile.current_stage as u8).saturating_sub(1);
-                            dpi_stages_data[6] = 0x00;
-                            let mut dpi_sum = 0u8;
-                            for b in &dpi_stages_data[0..7] {
-                                dpi_sum = dpi_sum.wrapping_add(*b);
-                            }
-                            dpi_stages_data[7] = (0x55u8).wrapping_sub(dpi_sum);
-                            let _ = write_mouse_eeprom(&dev, 0x0054, &dpi_stages_data);
-                            std::thread::sleep(std::time::Duration::from_millis(30));
-
-                            // 4. Set Logo RGB (EEPROM Addr 0x0058, 2 bytes)
-                            on_progress(0.68, "Updating Logo LED...");
-                            let logo_effect = match profile.dpi_effect {
-                                DpiEffect::Steady => 0x01,
-                                DpiEffect::Respiration => 0x02,
-                                DpiEffect::Off => 0x00,
-                            };
-                            let logo_chk = (0x55u8).wrapping_sub(logo_effect);
-                            let logo_data = [logo_effect, logo_chk];
-                            let _ = write_mouse_eeprom(&dev, 0x0058, &logo_data);
-                            std::thread::sleep(std::time::Duration::from_millis(30));
-
-                            // 5. Set DPI Stage Colors (EEPROM Addr 0x004C, 6 bytes)
-                            on_progress(0.78, "Saving DPI Stage Indicators...");
-                            let mut dpi_colors = [0u8; 6];
-                            for (idx, stage) in profile.dpi_stages.iter().enumerate().take(5) {
-                                dpi_colors[idx] = stage.color_rgb[0]; // Stage color identifier
-                            }
-                            let mut color_sum = 0u8;
-                            for b in &dpi_colors[0..5] {
-                                color_sum = color_sum.wrapping_add(*b);
-                            }
-                            dpi_colors[5] = (0x55u8).wrapping_sub(color_sum);
-                            let _ = write_mouse_eeprom(&dev, 0x004C, &dpi_colors);
-                            std::thread::sleep(std::time::Duration::from_millis(30));
-
-                            // 6. Set Button Matrix (EEPROM Addr 0x0060..0x007F, 8 buttons * 4 bytes)
-                            on_progress(0.88, "Writing Hardware Button Matrix...");
+                            // 1. Button Matrix (EEPROM Addr 0x0060..0x009F, written in chunks)
+                            on_progress(0.15, "Writing Hardware Button Matrix...");
                             for (idx, b_action) in profile.button_actions.iter().enumerate().take(8) {
                                 let (b0, b1, b2): (u8, u8, u8) = match b_action.as_str() {
                                     "Left button" => (0x01, 0x01, 0x00),
@@ -441,13 +559,85 @@ impl HardwareBridge {
                                 let btn_addr = 0x0060 + (idx as u16 * 4);
                                 let _ = write_mouse_eeprom(&dev, btn_addr, &btn_chunk);
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(30));
+                            std::thread::sleep(std::time::Duration::from_millis(15));
 
-                            // 7. COMMIT & FLASH SAVE: SendCMD(0x09, 0x00) followed by SendCMD(0x02, 0x00)
-                            on_progress(0.96, "Committing to Mouse Flash Memory...");
-                            let _ = send_mouse_cmd(&dev, 0x09, 0x00);
-                            std::thread::sleep(std::time::Duration::from_millis(40));
-                            let _ = send_mouse_cmd(&dev, 0x02, 0x00);
+                            // 2. DPI Stage Values (EEPROM Addr 0x000C + 4*i, 4 bytes each [x_code, y_code, hi_range, chk])
+                            // Uses PixArt PAW3325 lookup code table
+                            on_progress(0.30, "Calibrating Sensor DPI Stages...");
+                            for (idx, stage) in profile.dpi_stages.iter().enumerate().take(5) {
+                                let (x_code, hi_range_x) = dpi_to_paw3325_code(stage.x);
+                                let (y_code, _) = dpi_to_paw3325_code(stage.y);
+                                let hi_byte = if hi_range_x { 0x01 } else { 0x00 };
+                                let stage_sum = x_code.wrapping_add(y_code).wrapping_add(hi_byte);
+                                let stage_chk = (0x55u8).wrapping_sub(stage_sum);
+                                let stage_chunk = [x_code, y_code, hi_byte, stage_chk];
+                                let stage_addr = 0x000C + (idx as u16 * 4);
+                                let _ = write_mouse_eeprom(&dev, stage_addr, &stage_chunk);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(15));
+
+                            // 3. Active DPI Stage Count (EEPROM Addr 0x0002, 2 bytes)
+                            // Note: OEM writes total active stage count (e.g. 05 50)
+                            on_progress(0.45, "Writing DPI stage configuration count...");
+                            let active_count: u8 = profile.dpi_stages.iter().take(5).filter(|s| s.enabled).count() as u8;
+                            let count_byte = if active_count == 0 { 5 } else { active_count };
+                            let count_chk = (0x55u8).wrapping_sub(count_byte);
+                            let _ = write_mouse_eeprom(&dev, 0x0002, &[count_byte, count_chk]);
+                            std::thread::sleep(std::time::Duration::from_millis(15));
+
+                            // 4. DPI Stage Indicator Colors (EEPROM Addr 0x002C + 4*i, 4 bytes each [R, G, B, chk])
+                            on_progress(0.60, "Writing DPI Stage Color Indicators...");
+                            for (idx, stage) in profile.dpi_stages.iter().enumerate().take(5) {
+                                let r = stage.color_rgb[0];
+                                let g = stage.color_rgb[1];
+                                let b = stage.color_rgb[2];
+                                let color_sum = r.wrapping_add(g).wrapping_add(b);
+                                let color_chk = (0x55u8).wrapping_sub(color_sum);
+                                let color_chunk = [r, g, b, color_chk];
+                                let color_addr = 0x002C + (idx as u16 * 4);
+                                let _ = write_mouse_eeprom(&dev, color_addr, &color_chunk);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(15));
+
+                            // 5. Main RGB Lighting (EEPROM Addr 0x00A0, 7 bytes: [effect, R, G, B, speed, brightness, chk])
+                            on_progress(0.75, "Writing Main RGB Lighting & Effects...");
+                            let spd_idx = (profile.led_speed.clamp(1, 10) - 1) as usize;
+                            let bri_idx = (profile.led_brightness.clamp(1, 10) - 1) as usize;
+                            let (hw_effect, hw_spd, hw_bri) = match profile.led_effect {
+                                LedEffect::Steady => (0x02u8, SPEED_LUT[spd_idx], BRIGHTNESS_LUT[bri_idx]),
+                                LedEffect::Respiration => (0x01u8, SPEED_LUT[spd_idx], BRIGHTNESS_LUT[bri_idx]),
+                                LedEffect::Neon => (0x00u8, NEON_SPEED_LUT[spd_idx], BRIGHTNESS_LUT[bri_idx]),
+                                LedEffect::Streaming => (0x04u8, SPEED_LUT[spd_idx], BRIGHTNESS_LUT[bri_idx]),
+                                LedEffect::Off => (0x04u8, SPEED_LUT[spd_idx], 0x00u8),
+                            };
+
+                            let mut main_rgb = [0u8; 7];
+                            main_rgb[0] = hw_effect;
+                            main_rgb[1] = profile.led_color[0]; // Red
+                            main_rgb[2] = profile.led_color[1]; // Green
+                            main_rgb[3] = profile.led_color[2]; // Blue
+                            main_rgb[4] = hw_spd;               // Speed LUT
+                            main_rgb[5] = hw_bri;               // Brightness LUT
+                            let mut rgb_sum = 0u8;
+                            for b in &main_rgb[0..6] {
+                                rgb_sum = rgb_sum.wrapping_add(*b);
+                            }
+                            main_rgb[6] = (0x55u8).wrapping_sub(rgb_sum);
+                            let _ = write_mouse_eeprom(&dev, 0x00A0, &main_rgb);
+                            std::thread::sleep(std::time::Duration::from_millis(15));
+
+                            // 6. Logo / DPI LED Effect Block (EEPROM Addr 0x004C, 2 bytes in off mode: [0x00, 0x55])
+                            on_progress(0.85, "Writing Logo/DPI LED Parameters...");
+                            let logo_data = [0x00u8, 0x55u8];
+                            let _ = write_mouse_eeprom(&dev, 0x004C, &logo_data);
+                            std::thread::sleep(std::time::Duration::from_millis(15));
+
+                            // 7. USB Polling Rate (EEPROM Addr 0x0000, 2 bytes) - Concludes Apply Sequence
+                            on_progress(0.95, "Setting USB Polling Rate...");
+                            let rate_chk = (0x55u8).wrapping_sub(rate_hw_byte);
+                            let rate_data = [rate_hw_byte, rate_chk];
+                            let _ = write_mouse_eeprom(&dev, 0x0000, &rate_data);
+                            std::thread::sleep(std::time::Duration::from_millis(15));
 
                             on_progress(1.0, "Configuration Applied Successfully!");
                             delivered = true;
@@ -457,7 +647,7 @@ impl HardwareBridge {
             }
         }
 
-        // 3. Sync to OEM database %LOCALAPPDATA%\JM01\pro.dct
+        // 3. Sync to OEM database %LOCALAPPDATA%\JM01\pro.dct and curid.dct
         let oem_path = get_oem_profile_path();
         if let Some(path) = oem_path {
             if path.exists() {
@@ -465,15 +655,20 @@ impl HardwareBridge {
                     let prof_size = 2992;
                     let prof_offset = profile_index * prof_size;
                     if prof_offset + prof_size <= bytes.len() {
-                        bytes[0] = 0x34;
-                        bytes[1] = 0x12;
-                        bytes[2] = 0xAA;
-                        bytes[3] = 0xFC;
-                        bytes[4] = (profile_index as u8) + 1;
+                        // Magic 0xFCAA1234 on profile record
+                        bytes[prof_offset] = 0x34;
+                        bytes[prof_offset + 1] = 0x12;
+                        bytes[prof_offset + 2] = 0xAA;
+                        bytes[prof_offset + 3] = 0xFC;
+                        // Profile ID in slot (non-zero)
+                        if bytes[prof_offset + 4] == 0 {
+                            bytes[prof_offset + 4] = (profile_index as u8) + 1;
+                        }
 
+                        // DPI stages at +0xA08 (16 bytes each: X, Y, RGB, enabled)
                         for (i, stage) in profile.dpi_stages.iter().enumerate().take(5) {
                             let stage_base = prof_offset + 0x0A08 + (i * 16);
-                            if stage_base + 12 <= bytes.len() {
+                            if stage_base + 16 <= bytes.len() {
                                 let val_x = (stage.x as u32).to_le_bytes();
                                 let val_y = (stage.y as u32).to_le_bytes();
                                 bytes[stage_base..stage_base+4].copy_from_slice(&val_x);
@@ -481,31 +676,57 @@ impl HardwareBridge {
                                 bytes[stage_base+8] = stage.color_rgb[0];
                                 bytes[stage_base+9] = stage.color_rgb[1];
                                 bytes[stage_base+10] = stage.color_rgb[2];
+                                bytes[stage_base+12] = if stage.enabled { 1 } else { 0 };
                             }
                         }
 
-                        let rate_offset = prof_offset + 0x0A94;
+                        // Report rate at +0x9E4 (0x125, 0x250, 0x500, 0x1000)
+                        let rate_offset = prof_offset + 0x09E4;
                         if rate_offset + 4 <= bytes.len() {
                             let rate_val: u32 = match profile.polling_rate {
-                                PollingRate::Hz125 => 1,
-                                PollingRate::Hz250 => 2,
-                                PollingRate::Hz500 => 3,
-                                PollingRate::Hz1000 => 4,
+                                PollingRate::Hz125 => 0x125,
+                                PollingRate::Hz250 => 0x250,
+                                PollingRate::Hz500 => 0x500,
+                                PollingRate::Hz1000 => 0x1000,
                             };
                             bytes[rate_offset..rate_offset+4].copy_from_slice(&rate_val.to_le_bytes());
                         }
 
-                        let led_offset = prof_offset + 0x0A9C;
-                        if led_offset + 8 <= bytes.len() {
-                            bytes[led_offset] = profile.led_effect as u8;
-                            bytes[led_offset + 1] = profile.led_brightness;
-                            bytes[led_offset + 2] = profile.led_speed;
-                            bytes[led_offset + 4] = profile.led_color[0];
-                            bytes[led_offset + 5] = profile.led_color[1];
-                            bytes[led_offset + 6] = profile.led_color[2];
+                        // Main LED at +0xA88..+0xA97:
+                        // +0xA88: effect (u32: 1=Steady, 2=Respiration, 3=Neon, 4/0=Streaming/Off)
+                        // +0xA8C: speed index (u32: 1..10)
+                        // +0xA90: brightness index (u32: 1..10)
+                        // +0xA94..+0xA96: RGB (3 bytes)
+                        let led_eff_offset = prof_offset + 0x0A88;
+                        if led_eff_offset + 16 <= bytes.len() {
+                            let eff_val: u32 = match profile.led_effect {
+                                LedEffect::Steady => 1,
+                                LedEffect::Respiration => 2,
+                                LedEffect::Neon => 3,
+                                LedEffect::Streaming => 4,
+                                LedEffect::Off => 0,
+                            };
+                            let spd_val: u32 = profile.led_speed as u32;
+                            let bri_val: u32 = profile.led_brightness as u32;
+
+                            bytes[led_eff_offset..led_eff_offset+4].copy_from_slice(&eff_val.to_le_bytes());
+                            bytes[led_eff_offset+4..led_eff_offset+8].copy_from_slice(&spd_val.to_le_bytes());
+                            bytes[led_eff_offset+8..led_eff_offset+12].copy_from_slice(&bri_val.to_le_bytes());
+                            bytes[led_eff_offset+12] = profile.led_color[0];
+                            bytes[led_eff_offset+13] = profile.led_color[1];
+                            bytes[led_eff_offset+14] = profile.led_color[2];
                         }
 
                         let _ = fs::write(&path, &bytes);
+
+                        // Sync curid.dct
+                        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                            let curid_path = Path::new(&local_app_data).join("JM01").join("curid.dct");
+                            let mut id_bytes = [0u8; 4];
+                            id_bytes.copy_from_slice(&bytes[prof_offset + 4..prof_offset + 8]);
+                            let _ = fs::write(curid_path, &id_bytes);
+                        }
+
                         delivered = true;
                     }
                 }
@@ -520,16 +741,66 @@ impl HardwareBridge {
     }
 }
 
+pub fn export_jmk_bytes(profile: &MouseProfile, profile_index: usize) -> Vec<u8> {
+    let mut data = vec![0u8; 11332];
+    data[0] = 0x34;
+    data[1] = 0x12;
+    data[2] = 0xAA;
+    data[3] = 0xFC;
+    data[4] = (profile_index as u8) + 1;
+
+    let rate_val: u32 = match profile.polling_rate {
+        PollingRate::Hz125 => 0x125,
+        PollingRate::Hz250 => 0x250,
+        PollingRate::Hz500 => 0x500,
+        PollingRate::Hz1000 => 0x1000,
+    };
+    data[0x09E4..0x09E4+4].copy_from_slice(&rate_val.to_le_bytes());
+
+    for (i, stage) in profile.dpi_stages.iter().enumerate().take(5) {
+        let base = 0x0A08 + (i * 16);
+        let val_x = (stage.x as u32).to_le_bytes();
+        let val_y = (stage.y as u32).to_le_bytes();
+        data[base..base+4].copy_from_slice(&val_x);
+        data[base+4..base+8].copy_from_slice(&val_y);
+        data[base+8] = stage.color_rgb[0];
+        data[base+9] = stage.color_rgb[1];
+        data[base+10] = stage.color_rgb[2];
+        data[base+12] = if stage.enabled { 1 } else { 0 };
+    }
+
+    let eff_val: u32 = match profile.led_effect {
+        LedEffect::Steady => 1,
+        LedEffect::Respiration => 2,
+        LedEffect::Neon => 3,
+        LedEffect::Streaming => 4,
+        LedEffect::Off => 0,
+    };
+    data[0x0A88..0x0A88+4].copy_from_slice(&eff_val.to_le_bytes());
+    data[0x0A8C..0x0A8C+4].copy_from_slice(&(profile.led_speed as u32).to_le_bytes());
+    data[0x0A90..0x0A90+4].copy_from_slice(&(profile.led_brightness as u32).to_le_bytes());
+    data[0x0A94] = profile.led_color[0];
+    data[0x0A95] = profile.led_color[1];
+    data[0x0A96] = profile.led_color[2];
+
+    data
+}
+
 pub fn parse_jmk_bytes(bytes: &[u8]) -> Option<MouseProfile> {
     if bytes.len() < 2992 {
         return None;
     }
+    // Verify OEM magic 0xFCAA1234
+    if bytes[0] != 0x34 || bytes[1] != 0x12 || bytes[2] != 0xAA || bytes[3] != 0xFC {
+        return None;
+    }
+
     let mut profile = MouseProfile::default();
     let prof_offset = 0;
 
     for (i, stage) in profile.dpi_stages.iter_mut().enumerate().take(5) {
         let stage_base = prof_offset + 0x0A08 + (i * 16);
-        if stage_base + 12 <= bytes.len() {
+        if stage_base + 16 <= bytes.len() {
             let x = u32::from_le_bytes(bytes[stage_base..stage_base+4].try_into().unwrap_or([0,0,0,0]));
             let y = u32::from_le_bytes(bytes[stage_base+4..stage_base+8].try_into().unwrap_or([0,0,0,0]));
             if x >= 100 && x <= 10000 {
@@ -537,22 +808,39 @@ pub fn parse_jmk_bytes(bytes: &[u8]) -> Option<MouseProfile> {
                 stage.y = y;
             }
             stage.color_rgb = [bytes[stage_base+8], bytes[stage_base+9], bytes[stage_base+10]];
+            stage.enabled = bytes[stage_base+12] != 0;
         }
     }
 
-    let led_offset = prof_offset + 0x0A9C;
-    if led_offset + 7 <= bytes.len() {
-        let effect_byte = bytes[led_offset];
-        profile.led_effect = match effect_byte {
+    // Polling rate at +0x9E4
+    let rate_offset = prof_offset + 0x09E4;
+    if rate_offset + 4 <= bytes.len() {
+        let rate_code = u32::from_le_bytes(bytes[rate_offset..rate_offset+4].try_into().unwrap_or([0,0,0,0]));
+        profile.polling_rate = match rate_code {
+            0x125 => PollingRate::Hz125,
+            0x250 => PollingRate::Hz250,
+            0x500 => PollingRate::Hz500,
+            _ => PollingRate::Hz1000,
+        };
+    }
+
+    // Main LED at +0xA88
+    let led_eff_offset = prof_offset + 0x0A88;
+    if led_eff_offset + 15 <= bytes.len() {
+        let eff = u32::from_le_bytes(bytes[led_eff_offset..led_eff_offset+4].try_into().unwrap_or([0,0,0,0]));
+        let spd = u32::from_le_bytes(bytes[led_eff_offset+4..led_eff_offset+8].try_into().unwrap_or([0,0,0,0]));
+        let bri = u32::from_le_bytes(bytes[led_eff_offset+8..led_eff_offset+12].try_into().unwrap_or([0,0,0,0]));
+
+        profile.led_effect = match eff {
             1 => LedEffect::Steady,
             2 => LedEffect::Respiration,
             3 => LedEffect::Neon,
             4 => LedEffect::Streaming,
             _ => LedEffect::Off,
         };
-        profile.led_brightness = bytes[led_offset + 1].clamp(1, 10);
-        profile.led_speed = bytes[led_offset + 2].clamp(1, 10);
-        profile.led_color = [bytes[led_offset + 4], bytes[led_offset + 5], bytes[led_offset + 6]];
+        profile.led_speed = (spd as u8).clamp(1, 10);
+        profile.led_brightness = (bri as u8).clamp(1, 10);
+        profile.led_color = [bytes[led_eff_offset+12], bytes[led_eff_offset+13], bytes[led_eff_offset+14]];
     }
 
     Some(profile)

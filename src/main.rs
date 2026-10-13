@@ -7,7 +7,7 @@ use std::time::Instant;
 use eframe::egui;
 use hardware::{parse_jmk_bytes, DpiEffect, HardwareBridge, LedEffect, MacroItem, MouseProfile, PollingRate, DEFAULT_PID_WIRED, DEFAULT_PID_WIRELESS};
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, MenuId},
+    menu::{Menu, MenuEvent, MenuItem},
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
@@ -113,7 +113,14 @@ fn set_autostart(enable: bool) {
     }
 }
 
-fn build_tray() -> (Option<TrayIcon>, Option<MenuId>, Option<MenuId>, Option<MenuId>) {
+#[derive(Clone, Copy, PartialEq)]
+enum TrayAction {
+    Show,
+    Hide,
+}
+
+fn build_tray() -> (Option<TrayIcon>, std::sync::mpsc::Receiver<TrayAction>) {
+    let (tx, rx) = std::sync::mpsc::channel();
     let menu = Menu::new();
     let item_show = MenuItem::new("Show Redragon Suite", true, None);
     let item_hide = MenuItem::new("Hide to Tray", true, None);
@@ -126,6 +133,16 @@ fn build_tray() -> (Option<TrayIcon>, Option<MenuId>, Option<MenuId>, Option<Men
     let _ = menu.append(&item_show);
     let _ = menu.append(&item_hide);
     let _ = menu.append(&item_quit);
+
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if event.id == id_quit {
+            std::process::exit(0);
+        } else if event.id == id_show {
+            let _ = tx.send(TrayAction::Show);
+        } else if event.id == id_hide {
+            let _ = tx.send(TrayAction::Hide);
+        }
+    }));
 
     let icon = if let Ok(img) = image::load_from_memory(LOGO_PNG_BYTES) {
         let rgba = img.resize_exact(32, 32, image::imageops::FilterType::Lanczos3).to_rgba8();
@@ -143,20 +160,9 @@ fn build_tray() -> (Option<TrayIcon>, Option<MenuId>, Option<MenuId>, Option<Men
             .build()
             .ok();
 
-        // Spawn a dedicated listener thread for Quit menu event so clicking "Quit" in tray terminates
-        // immediately even if the window is hidden and GUI repainting is paused by the OS.
-        let quit_id = id_quit.clone();
-        std::thread::spawn(move || {
-            while let Ok(menu_event) = MenuEvent::receiver().recv() {
-                if menu_event.id == quit_id {
-                    std::process::exit(0);
-                }
-            }
-        });
-
-        (tray, Some(id_show), Some(id_hide), Some(id_quit))
+        (tray, rx)
     } else {
-        (None, None, None, None)
+        (None, rx)
     }
 }
 
@@ -196,9 +202,7 @@ struct RedragonApp {
     minimize_to_tray: bool,
     autostart_with_windows: bool,
     _tray: Option<TrayIcon>,
-    tray_show_id: Option<MenuId>,
-    tray_hide_id: Option<MenuId>,
-    tray_quit_id: Option<MenuId>,
+    tray_rx: std::sync::mpsc::Receiver<TrayAction>,
     // Apply progress worker state
     apply_rx: Option<std::sync::mpsc::Receiver<(f32, String)>>,
     apply_progress: Option<(f32, String)>,
@@ -271,7 +275,7 @@ impl Default for RedragonApp {
         ];
 
         let autostart = is_autostart_enabled();
-        let (tray, id_show, id_hide, id_quit) = build_tray();
+        let (tray, tray_rx) = build_tray();
         let bridge = HardwareBridge::new();
         let conn = bridge.connected;
         let charg = bridge.is_charging;
@@ -308,9 +312,7 @@ impl Default for RedragonApp {
             minimize_to_tray: true,
             autostart_with_windows: autostart,
             _tray: tray,
-            tray_show_id: id_show,
-            tray_hide_id: id_hide,
-            tray_quit_id: id_quit,
+            tray_rx,
             apply_rx: None,
             apply_progress: None,
             dpi_toast_time: None,
@@ -318,6 +320,8 @@ impl Default for RedragonApp {
             dpi_toast_val: 1000,
             dpi_toast_color: egui::Color32::from_rgb(0, 255, 255),
         };
+
+        trim_memory();
 
         app.add_log(LogLevel::Info, "Redragon Invader Pro Suite initialized.");
         if app.bridge.connected {
@@ -357,15 +361,16 @@ impl eframe::App for RedragonApp {
         }
 
         // Handle Tray Menu Events
-        if let Ok(menu_event) = MenuEvent::receiver().try_recv() {
-            if Some(&menu_event.id) == self.tray_show_id.as_ref() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if Some(&menu_event.id) == self.tray_hide_id.as_ref() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                trim_memory();
-            } else if Some(&menu_event.id) == self.tray_quit_id.as_ref() {
-                std::process::exit(0);
+        while let Ok(action) = self.tray_rx.try_recv() {
+            match action {
+                TrayAction::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::Hide => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    trim_memory();
+                }
             }
         }
 
@@ -642,13 +647,22 @@ impl eframe::App for RedragonApp {
 
                     if ui.button("Export Profile").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("profile.json")
-                            .add_filter("JSON Profile", &["json"])
+                            .set_file_name("profile.jmk")
+                            .add_filter("JMK Binary Profile (*.jmk)", &["jmk"])
+                            .add_filter("JSON Profile (*.json)", &["json"])
                             .save_file() {
-                            let json = serde_json::to_string_pretty(&self.profiles[self.active_profile_idx]).unwrap_or_default();
-                            let _ = fs::write(&path, json);
-                            self.status_msg = "Profile exported!".to_string();
-                            self.add_log(LogLevel::Success, format!("Active Profile {} exported to JSON: {:?}", self.active_profile_idx + 1, path.file_name().unwrap_or_default()));
+                            let is_jmk = path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("jmk")).unwrap_or(false);
+                            if is_jmk {
+                                let bytes = hardware::export_jmk_bytes(&self.profiles[self.active_profile_idx], self.active_profile_idx);
+                                let _ = fs::write(&path, bytes);
+                                self.status_msg = "Profile exported as OEM JMK binary format!".to_string();
+                                self.add_log(LogLevel::Success, format!("Active Profile {} exported as JMK: {:?}", self.active_profile_idx + 1, path.file_name().unwrap_or_default()));
+                            } else {
+                                let json = serde_json::to_string_pretty(&self.profiles[self.active_profile_idx]).unwrap_or_default();
+                                let _ = fs::write(&path, json);
+                                self.status_msg = "Profile exported!".to_string();
+                                self.add_log(LogLevel::Success, format!("Active Profile {} exported to JSON: {:?}", self.active_profile_idx + 1, path.file_name().unwrap_or_default()));
+                            }
                         }
                     }
 
@@ -967,21 +981,54 @@ impl eframe::App for RedragonApp {
 
                 AppTab::Macro => {
                     ui.columns(2, |columns| {
-                        // Left column: Macro List
+                        // Left column: Macro List & Slots
                         columns[0].vertical(|ui| {
-                            ui.label(egui::RichText::new("Macro list").strong().size(14.0));
+                            let slots_used = self.macros.len();
+                            let slots_remaining = 16usize.saturating_sub(slots_used);
+                            let slot_badge_color = if slots_used >= 16 {
+                                egui::Color32::from_rgb(220, 53, 69) // Red (Full)
+                            } else if slots_used >= 12 {
+                                egui::Color32::from_rgb(255, 165, 0) // Orange (Near limit)
+                            } else {
+                                egui::Color32::from_rgb(40, 167, 69) // Green (Available)
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Macro list").strong().size(14.0));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{}/16 Slots ({} free)", slots_used, slots_remaining))
+                                            .size(11.0)
+                                            .color(slot_badge_color)
+                                            .strong()
+                                    );
+                                });
+                            });
+
+                            // Hardware EEPROM Storage Allocation Bar
+                            let slot_ratio = (slots_used as f32) / 16.0;
+                            ui.add(
+                                egui::ProgressBar::new(slot_ratio)
+                                    .desired_height(4.0)
+                                    .fill(slot_badge_color)
+                            );
                             ui.add_space(4.0);
 
                             egui::Frame::group(ui.style())
                                 .inner_margin(8.0)
                                 .show(ui, |ui| {
                                     egui::ScrollArea::vertical()
-                                        .min_scrolled_height(240.0)
-                                        .max_height(260.0)
+                                        .id_salt("macro_list_scroll_area")
+                                        .min_scrolled_height(230.0)
+                                        .max_height(250.0)
                                         .show(ui, |ui| {
+                                            if self.macros.is_empty() {
+                                                ui.label(egui::RichText::new("No macros created. Create one below.").italics().weak());
+                                            }
                                             for (idx, m) in self.macros.iter().enumerate() {
                                                 let is_sel = self.selected_macro_idx == idx;
-                                                if ui.selectable_label(is_sel, &m.name).clicked() {
+                                                let label_text = format!("[Slot {:02}] {} ({} evts)", idx + 1, m.name, m.key_events.len());
+                                                if ui.selectable_label(is_sel, label_text).clicked() {
                                                     self.selected_macro_idx = idx;
                                                     self.selected_key_event_idx = None;
                                                 }
@@ -990,21 +1037,62 @@ impl eframe::App for RedragonApp {
                                 });
 
                             ui.add_space(8.0);
+
+                            // Macro Name Input & Character Counter (Max 15 chars per OEM EEPROM spec)
+                            if self.new_macro_name.chars().count() > 15 {
+                                self.new_macro_name = self.new_macro_name.chars().take(15).collect();
+                            }
+                            let char_count = self.new_macro_name.chars().count();
+                            let char_color = if char_count >= 15 {
+                                egui::Color32::from_rgb(255, 140, 0)
+                            } else {
+                                egui::Color32::GRAY
+                            };
+
                             ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.new_macro_name).desired_width(110.0));
-                                if ui.button("+ New").clicked() {
-                                    if !self.new_macro_name.trim().is_empty() {
-                                        let name = self.new_macro_name.trim().to_string();
-                                        self.macros.push(MacroItem {
-                                            name: name.clone(),
-                                            key_events: Vec::new(),
-                                        });
-                                        self.selected_macro_idx = self.macros.len() - 1;
-                                        self.selected_key_event_idx = None;
+                                ui.label(egui::RichText::new("Name (max 15 chars):").size(11.0).weak());
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(egui::RichText::new(format!("{}/15", char_count)).size(10.5).color(char_color).monospace());
+                                });
+                            });
+
+                            ui.horizontal(|ui| {
+                                let name_edit = egui::TextEdit::singleline(&mut self.new_macro_name)
+                                    .char_limit(15)
+                                    .hint_text("Macro Name")
+                                    .desired_width(115.0);
+                                ui.add(name_edit);
+
+                                let can_create = slots_used < 16 && !self.new_macro_name.trim().is_empty();
+                                let mut new_btn = ui.add_enabled(can_create, egui::Button::new("+ New"));
+                                if slots_used >= 16 {
+                                    new_btn = new_btn.on_disabled_hover_text("Hardware storage limit reached: Mouse EEPROM stores up to 16 macros maximum.");
+                                } else if self.new_macro_name.trim().is_empty() {
+                                    new_btn = new_btn.on_disabled_hover_text("Enter a name (1..15 characters) to create a macro.");
+                                }
+
+                                if new_btn.clicked() && can_create {
+                                    let name: String = self.new_macro_name.trim().chars().take(15).collect();
+                                    self.macros.push(MacroItem {
+                                        name: name.clone(),
+                                        key_events: Vec::new(),
+                                    });
+                                    self.selected_macro_idx = self.macros.len() - 1;
+                                    self.selected_key_event_idx = None;
+                                    self.new_macro_name.clear();
+                                    self.add_log(LogLevel::Info, format!("Created macro '[Slot {:02}] {}' (Storage: {}/16)", self.macros.len(), name, self.macros.len()));
+                                }
+
+                                if ui.button("Rename").clicked() {
+                                    if !self.new_macro_name.trim().is_empty() && self.selected_macro_idx < self.macros.len() {
+                                        let new_name: String = self.new_macro_name.trim().chars().take(15).collect();
+                                        let old_name = self.macros[self.selected_macro_idx].name.clone();
+                                        self.macros[self.selected_macro_idx].name = new_name.clone();
                                         self.new_macro_name.clear();
-                                        self.add_log(LogLevel::Info, format!("Created new macro profile '{}'", name));
+                                        self.add_log(LogLevel::Info, format!("Renamed macro '{}' to '{}'", old_name, new_name));
                                     }
                                 }
+
                                 if ui.button("Delete").clicked() {
                                     if !self.macros.is_empty() && self.selected_macro_idx < self.macros.len() {
                                         let removed = self.macros.remove(self.selected_macro_idx);
@@ -1012,7 +1100,7 @@ impl eframe::App for RedragonApp {
                                             self.selected_macro_idx -= 1;
                                         }
                                         self.selected_key_event_idx = None;
-                                        self.add_log(LogLevel::Info, format!("Deleted macro '{}'", removed.name));
+                                        self.add_log(LogLevel::Info, format!("Deleted macro '{}' (Freed slot, {}/16 used)", removed.name, self.macros.len()));
                                     }
                                 }
                             });
@@ -1020,13 +1108,20 @@ impl eframe::App for RedragonApp {
 
                         // Right column: Key List & Actions
                         columns[1].vertical(|ui| {
-                            ui.label(egui::RichText::new("Key list").strong().size(14.0));
+                            let evt_count = self.macros.get(self.selected_macro_idx).map(|m| m.key_events.len()).unwrap_or(0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Key list").strong().size(14.0));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(egui::RichText::new(format!("{} recorded events", evt_count)).size(11.0).weak());
+                                });
+                            });
                             ui.add_space(4.0);
 
                             egui::Frame::group(ui.style())
                                 .inner_margin(8.0)
                                 .show(ui, |ui| {
                                     egui::ScrollArea::vertical()
+                                        .id_salt("key_list_scroll_area")
                                         .min_scrolled_height(170.0)
                                         .max_height(190.0)
                                         .show(ui, |ui| {
@@ -1036,7 +1131,8 @@ impl eframe::App for RedragonApp {
                                                 } else {
                                                     for (e_idx, evt) in m.key_events.iter().enumerate() {
                                                         let is_sel = self.selected_key_event_idx == Some(e_idx);
-                                                        if ui.selectable_label(is_sel, evt).clicked() {
+                                                        let label_txt = format!("{:02}. {}", e_idx + 1, evt);
+                                                        if ui.selectable_label(is_sel, label_txt).clicked() {
                                                             self.selected_key_event_idx = Some(e_idx);
                                                         }
                                                     }

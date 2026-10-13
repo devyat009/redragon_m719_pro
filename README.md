@@ -73,22 +73,31 @@ Communication with the onboard controller is performed over USB HID Feature Repo
 - **Notification / Response Endpoint:** Report ID `0x09`, Usage Page `0xFF01` (Usage `0x01`)
 - **Battery Feature Report:** Report ID `0x06`, Usage Page `0xFF04` (Usage `0x04`)
 
-### Packet Checksum Algorithm
-Every EEPROM write payload is validated by the mouse MCU using a 4-byte checksum constraint where the sum of the 3 payload bytes plus the checksum byte equals `0x55` modulo 256:
+### Packet Framing & Checksum Algorithms
+1. **HID Feature Report Framing (17 Bytes):**
+   - Transmitted on Usage Page `0xFF02` (Command endpoint).
+   - Byte `0`: Report ID `0x08`.
+   - Byte `1`: Command ID (`0x07` Write EEPROM, `0x08` Read EEPROM, `0x09` Commit, `0x02` TellDrvStatus, `0x03` GetConnectStatus).
+   - Bytes `2..15`: Command payload parameters.
+   - Byte `16`: Frame checksum constraint: `(sum(pkt[0..15]) + pkt[16]) & 0xFF == 0x55`.
 
-```rust
-fn make_checksum_block(b0: u8, b1: u8, b2: u8) -> [u8; 4] {
-    let chk = (0x55u8).wrapping_sub(b0).wrapping_sub(b1).wrapping_sub(b2);
-    [b0, b1, b2, chk]
-}
-```
+2. **EEPROM Block Data Checksums:**
+   - Every block written to the onboard memory carries its own checksum trailer:
+   - For 4-byte key/stage blocks: `chk = 0x55 - (b0 + b1 + b2)`.
+   - For 7-byte Main RGB block: `chk = 0x55 - sum(bytes 0..5)`.
+   - For 2-byte register blocks: `chk = 0x55 - byte0`.
 
-### Memory Map Layout
-- **Offset `0x00` - `0x07`:** Profile metadata and active profile index.
-- **Offset `0x08` - `0x1F`:** Button remapping table (8 buttons, 3 bytes each).
-- **Offset `0x20` - `0x47`:** DPI stages, X/Y axes configuration, and stage color descriptors.
-- **Offset `0x48` - `0x5F`:** Lighting parameters (effect ID, brightness, frequency speed, RGB color).
-- **Offset `0x60` - `0x6F`:** USB Polling Rate (`125Hz`, `250Hz`, `500Hz`, `1000Hz`) and sensor performance flags.
+### Real EEPROM Hardware Memory Map Layout
+- **Address `0x0000` (2 Bytes):** USB Polling Rate (`0x01` = 1000Hz, `0x02` = 500Hz, `0x04` = 250Hz, `0x08` = 125Hz).
+- **Address `0x0002` (2 Bytes):** Count of disabled DPI stages (`[count, 0x55 - count]`).
+- **Address `0x000C + 4*i` (4 Bytes/stage):** Sensor DPI stage calibrations (`[Xcode, Ycode, hiRange, checksum]`). Codes mapped to PixArt PAW3325 LUT.
+- **Address `0x002C + 4*i` (4 Bytes/stage):** Sensor DPI stage LED indicator colors (`[Red, Green, Blue, checksum]`).
+- **Address `0x004C` (6 Bytes):** DPI Indicator LED effect mode (`[effect, chk, color_idx, chk, level, chk]`).
+- **Address `0x0054` - `0x005C`:** Logo LED effect parameters and mode registers.
+- **Address `0x0060 + 4*i` (4 Bytes/slot):** Hardware Key Matrix (8 slots, `[b0, b1, b2, checksum]`).
+- **Address `0x00A0` (7 Bytes):** Main RGB Lighting (`[effect, Red, Green, Blue, speed, brightness, checksum]`).
+- **Address `0x0100 + 0x20*i`:** Combo-key sequence memory.
+- **Address `0x0300 + 0x180*i`:** Onboard macro event storage (16 hardware slots).
 
 ---
 
