@@ -119,18 +119,39 @@ pub struct HardwareBridge {
     pub device_name: String,
     pub vid: u16,
     pub pid: u16,
+    // Diagnostic details:
+    pub found_dongle: bool,
+    pub found_wired: bool,
+    pub handshake_ok: bool,
+    pub last_status_detail: String,
+    hid_api: Option<hidapi::HidApi>,
 }
 
-// Helper to construct a 4-byte checksum block where b0 + b1 + b2 + checksum == 0x55
-fn make_checksum_block(b0: u8, b1: u8, b2: u8) -> [u8; 4] {
-    let chk = (0x55u8).wrapping_sub(b0).wrapping_sub(b1).wrapping_sub(b2);
-    [b0, b1, b2, chk]
+// Calculate the 17-byte HID Feature Report packet checksum used by the MCU firmware.
+// The MCU requires: (sum(pkt[0..15]) + pkt[16]) & 0xFF == 0x55.
+pub fn calc_packet_checksum(pkt: &[u8; 17]) -> u8 {
+    let mut sum: u8 = 0;
+    for i in 0..16 {
+        sum = sum.wrapping_add(pkt[i]);
+    }
+    (0x55u8).wrapping_sub(sum)
 }
 
-// Writes a chunk to mouse EEPROM via Report 0x08 on UsagePage 0xFF02
+// Sends a single command (nCmdID, bData) over Report 0x08 on UsagePage 0xFF02 with valid packet checksum.
+fn send_mouse_cmd(dev: &hidapi::HidDevice, cmd_id: u8, data: u8) -> Result<(), hidapi::HidError> {
+    let mut pkt = [0u8; 17];
+    pkt[0] = 0x08; // Report ID 0x08
+    pkt[1] = cmd_id;
+    pkt[2] = data;
+    pkt[16] = calc_packet_checksum(&pkt);
+    dev.send_feature_report(&pkt)
+}
+
+// Writes a chunk to mouse EEPROM via Report 0x08 on UsagePage 0xFF02.
+// Chunks up to 10 bytes (0x0A) per packet as required by the OEM MCU protocol.
 fn write_mouse_eeprom(dev: &hidapi::HidDevice, addr: u16, data: &[u8]) -> Result<(), hidapi::HidError> {
-    for (chunk_idx, chunk) in data.chunks(8).enumerate() {
-        let chunk_addr = addr + (chunk_idx * 8) as u16;
+    for (chunk_idx, chunk) in data.chunks(10).enumerate() {
+        let chunk_addr = addr + (chunk_idx * 10) as u16;
         let mut pkt = [0u8; 17];
         pkt[0] = 0x08; // Report ID 0x08
         pkt[1] = 0x07; // Command 0x07: Write EEPROM
@@ -138,7 +159,10 @@ fn write_mouse_eeprom(dev: &hidapi::HidDevice, addr: u16, data: &[u8]) -> Result
         pkt[3] = (chunk_addr & 0xFF) as u8;
         pkt[4] = chunk.len() as u8;
         pkt[5..5 + chunk.len()].copy_from_slice(chunk);
+        // Byte 16 is the packet checksum over pkt[0..15]
+        pkt[16] = calc_packet_checksum(&pkt);
         dev.send_feature_report(&pkt)?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     Ok(())
 }
@@ -153,6 +177,11 @@ impl HardwareBridge {
             device_name: "Scanning...".to_string(),
             vid: DEFAULT_VID,
             pid: DEFAULT_PID_WIRELESS,
+            found_dongle: false,
+            found_wired: false,
+            handshake_ok: false,
+            last_status_detail: String::new(),
+            hid_api: hidapi::HidApi::new().ok(),
         };
         bridge.detect();
         bridge
@@ -160,21 +189,42 @@ impl HardwareBridge {
 
     pub fn detect(&mut self) -> bool {
         let mut found_wired = false;
-        let mut found_wireless = false;
+        let mut found_dongle = false;
+        let mut mouse_responsive = false;
         let mut live_battery = 0u8;
 
-        if let Ok(api) = hidapi::HidApi::new() {
+        if self.hid_api.is_none() {
+            self.hid_api = hidapi::HidApi::new().ok();
+        }
+
+        if let Some(api) = &mut self.hid_api {
+            if api.refresh_devices().is_err() {
+                self.hid_api = hidapi::HidApi::new().ok();
+            }
+        }
+
+        if let Some(api) = &self.hid_api {
+            let mut dev_cmd = None;
+            let mut dev_notify = None;
+
             for device in api.device_list() {
                 if device.vendor_id() == DEFAULT_VID {
                     if device.product_id() == DEFAULT_PID_WIRED {
                         found_wired = true;
                     } else if device.product_id() == DEFAULT_PID_WIRELESS {
-                        found_wireless = true;
+                        found_dongle = true;
                     }
 
-                    // Query live battery & charging status from UsagePage 0xFF04 (Report 0x06)
+                    if device.usage_page() == 0xFF02 && dev_cmd.is_none() {
+                        dev_cmd = device.open_device(api).ok();
+                    }
+                    if device.usage_page() == 0xFF01 && dev_notify.is_none() {
+                        dev_notify = device.open_device(api).ok();
+                    }
+
+                    // Query live battery from UsagePage 0xFF04 (Report 0x06)
                     if device.usage_page() == 0xFF04 {
-                        if let Ok(dev) = device.open_device(&api) {
+                        if let Ok(dev) = device.open_device(api) {
                             let mut buf = [0u8; 9];
                             buf[0] = 0x06;
                             if let Ok(n) = dev.get_feature_report(&mut buf) {
@@ -182,6 +232,7 @@ impl HardwareBridge {
                                     let bat = buf[3];
                                     if bat > 0 && bat <= 100 {
                                         live_battery = bat;
+                                        mouse_responsive = true;
                                     }
                                 }
                             }
@@ -189,7 +240,36 @@ impl HardwareBridge {
                     }
                 }
             }
+
+            // Real Hardware Handshake: Verify if the mouse is physically switched ON and responsive
+            if found_dongle {
+                if let (Some(cmd), Some(notify)) = (dev_cmd, dev_notify) {
+                    let mut pkt = [0u8; 17];
+                    pkt[0] = 0x08;
+                    pkt[1] = 0x03; // GetConnectStatus
+                    pkt[16] = calc_packet_checksum(&pkt); // Exact checksum: 0x4A
+
+                    for _ in 0..3 {
+                        if cmd.send_feature_report(&pkt).is_ok() {
+                            let mut buf = [0u8; 64];
+                            if let Ok(n) = notify.read_timeout(&mut buf, 100) {
+                                if n >= 3 && buf[0] == 0x09 && buf[1] == 0x03 {
+                                    if (n >= 7 && (buf[5] != 0 || buf[6] != 0)) || live_battery > 0 {
+                                        mouse_responsive = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                    }
+                }
+            }
         }
+
+        self.found_dongle = found_dongle;
+        self.found_wired = found_wired;
+        self.handshake_ok = mouse_responsive;
 
         if live_battery > 0 {
             self.battery_percent = live_battery;
@@ -202,25 +282,52 @@ impl HardwareBridge {
             self.vid = DEFAULT_VID;
             self.pid = DEFAULT_PID_WIRED;
             self.device_name = "Redragon M719RGB-PRO (Wired USB)".to_string();
+            self.last_status_detail = "Wired USB cable connected and active.".to_string();
             true
-        } else if found_wireless {
+        } else if found_dongle && mouse_responsive {
             self.connected = true;
             self.is_wireless = true;
             self.is_charging = false;
             self.vid = DEFAULT_VID;
             self.pid = DEFAULT_PID_WIRELESS;
             self.device_name = "Redragon M719RGB-PRO (Wireless 2.4G)".to_string();
+            self.last_status_detail = "Wireless 2.4G dongle connected and mouse is powered ON and responding.".to_string();
             true
+        } else if found_dongle {
+            // Dongle plugged into PC USB, but mouse is turned OFF or asleep
+            self.connected = false;
+            self.is_wireless = true;
+            self.is_charging = false;
+            self.vid = DEFAULT_VID;
+            self.pid = DEFAULT_PID_WIRELESS;
+            self.device_name = "Redragon M719RGB-PRO (Mouse Off / Standby)".to_string();
+            self.last_status_detail = "2.4G USB Dongle (PID 0xFA7E) detected, but mouse power switch is OFF or mouse is in standby sleep mode.".to_string();
+            false
         } else {
             self.connected = false;
+            self.is_wireless = false;
             self.is_charging = false;
             self.device_name = "No Device Connected".to_string();
+            self.last_status_detail = "No Redragon USB device found (neither 2.4G receiver 0xFA7E nor wired USB cable 0xFAB0 detected on USB bus).".to_string();
             false
         }
     }
 
     pub fn apply_profile(&self, profile: &MouseProfile, profile_index: usize) -> Result<(), String> {
+        Self::apply_profile_direct(self.vid, profile, profile_index, |_, _| {})
+    }
+
+    pub fn apply_profile_with_progress<F: Fn(f32, &str)>(&self, profile: &MouseProfile, profile_index: usize, on_progress: F) -> Result<(), String> {
+        Self::apply_profile_direct(self.vid, profile, profile_index, on_progress)
+    }
+
+    pub fn apply_profile_direct<F: Fn(f32, &str)>(vid: u16, profile: &MouseProfile, profile_index: usize, on_progress: F) -> Result<(), String> {
+        const SPEED_LUT: [u8; 10] = [0xFF, 0xE6, 0xD2, 0xBE, 0xAA, 0x96, 0x82, 0x6E, 0x46, 0x28];
+        const BRIGHTNESS_LUT: [u8; 10] = [0x19, 0x32, 0x4B, 0x64, 0x7D, 0x96, 0xAF, 0xC8, 0xE1, 0xFF];
+
         let mut delivered = false;
+
+        on_progress(0.05, "Connecting to Mouse MCU...");
 
         if let Ok(api) = hidapi::HidApi::new() {
             // Polling rate code: 1000Hz -> 0x01, 500Hz -> 0x02, 250Hz -> 0x04, 125Hz -> 0x08
@@ -232,94 +339,117 @@ impl HardwareBridge {
             };
 
             for dev_info in api.device_list() {
-                if dev_info.vendor_id() == self.vid && (dev_info.product_id() == DEFAULT_PID_WIRED || dev_info.product_id() == DEFAULT_PID_WIRELESS) {
-                    // 1. PRIMARY EEPROM SYNC VIA USAGE PAGE 0xFF02 (Report 0x08)
+                if dev_info.vendor_id() == vid && (dev_info.product_id() == DEFAULT_PID_WIRED || dev_info.product_id() == DEFAULT_PID_WIRELESS) {
+                    // PRIMARY EEPROM SYNC VIA USAGE PAGE 0xFF02 (Report 0x08)
                     if dev_info.usage_page() == 0xFF02 {
                         if let Ok(dev) = dev_info.open_device(&api) {
-                            // A. Set Lighting (EEPROM Addr 0x0C, 8 bytes: two checksum blocks)
-                            let blk0 = make_checksum_block(
-                                profile.led_effect as u8,
-                                profile.led_brightness.clamp(1, 10),
-                                profile.led_speed.clamp(1, 10),
-                            );
-                            let blk1 = make_checksum_block(
-                                profile.led_color[0],
-                                profile.led_color[1],
-                                profile.led_color[2],
-                            );
-                            let mut led_data = [0u8; 8];
-                            led_data[0..4].copy_from_slice(&blk0);
-                            led_data[4..8].copy_from_slice(&blk1);
-                            let _ = write_mouse_eeprom(&dev, 0x000C, &led_data);
+                            // 1. Set USB Polling Rate (EEPROM Addr 0x0000, 2 bytes)
+                            on_progress(0.15, "Writing USB Polling Rate...");
+                            let rate_chk = (0x55u8).wrapping_sub(rate_hw_byte);
+                            let rate_data = [rate_hw_byte, rate_chk];
+                            let _ = write_mouse_eeprom(&dev, 0x0000, &rate_data);
+                            std::thread::sleep(std::time::Duration::from_millis(30));
 
-                            // B. Set USB Polling Rate (EEPROM Addr 0x00, 4 bytes: one checksum block)
-                            let rate_blk = make_checksum_block(rate_hw_byte, 0, 0);
-                            let _ = write_mouse_eeprom(&dev, 0x0000, &rate_blk);
-
-                            // C. Set Button Map (EEPROM Addr 0x4C, 8 buttons: 32 bytes)
-                            let mut btn_data = Vec::with_capacity(32);
-                            for b_action in &profile.button_actions {
-                                let (b0, b1, b2) = match b_action.as_str() {
-                                    "Left button" => (0x01, 0x11, 0x01),
-                                    "Right button" => (0x01, 0x13, 0x02),
-                                    "Middle button" => (0x01, 0x12, 0x03),
-                                    "Forward" => (0x01, 0x14, 0x05),
-                                    "Back" => (0x01, 0x15, 0x04),
-                                    "Fire key" => (0x08, 0xA4, 0x09),
-                                    "DPI +" => (0x08, 0xA8, 0x0B),
-                                    "DPI -" => (0x08, 0xA9, 0x0C),
-                                    "RGB ON/OFF" => (0x08, 0xA2, 0x06),
-                                    _ => (0x01, 0x11, 0x01),
-                                };
-                                btn_data.extend_from_slice(&make_checksum_block(b0, b1, b2));
-                            }
-                            let _ = write_mouse_eeprom(&dev, 0x004C, &btn_data);
-
-                            // D. Notify MCU to reload/refresh live settings (Command 0x02)
-                            let mut cmd_pkt = [0u8; 17];
-                            cmd_pkt[0] = 0x08;
-                            cmd_pkt[1] = 0x02; // Reload/Apply CMD
-                            let _ = dev.send_feature_report(&cmd_pkt);
-
-                            delivered = true;
-                        }
-                    }
-
-                    // 2. MCU RUNTIME CACHE SYNC VIA USAGE PAGE 0xFF04 (Report 0x06)
-                    if dev_info.usage_page() == 0xFF04 {
-                        if let Ok(dev) = dev_info.open_device(&api) {
-                            // Packet A: Set LED Effect, Brightness, Speed & Color (Report 0x06)
-                            let mut led_pkt = [0u8; 9];
-                            led_pkt[0] = 0x06;
-                            led_pkt[1] = 0x02;
-                            led_pkt[2] = profile.led_effect as u8;
-                            led_pkt[3] = profile.led_brightness;
-                            led_pkt[4] = profile.led_speed;
-                            led_pkt[5] = profile.led_color[0];
-                            led_pkt[6] = profile.led_color[1];
-                            led_pkt[7] = profile.led_color[2];
-                            let _ = dev.send_feature_report(&led_pkt);
-
-                            // Packet B: Set USB Polling Rate (Report 0x06)
-                            let rate_pkt_val = match profile.polling_rate {
-                                PollingRate::Hz125 => 1,
-                                PollingRate::Hz250 => 2,
-                                PollingRate::Hz500 => 3,
-                                PollingRate::Hz1000 => 4,
+                            // 2. Set Main RGB Lighting (EEPROM Addr 0x00A0, 7 bytes)
+                            on_progress(0.35, "Syncing RGB Lighting & Effects...");
+                            let spd_idx = (profile.led_speed.clamp(1, 10) - 1) as usize;
+                            let bri_idx = (profile.led_brightness.clamp(1, 10) - 1) as usize;
+                            let hw_spd = SPEED_LUT[spd_idx];
+                            let (hw_effect, hw_bri) = match profile.led_effect {
+                                LedEffect::Steady => (0x02, BRIGHTNESS_LUT[bri_idx]),
+                                LedEffect::Respiration => (0x01, BRIGHTNESS_LUT[bri_idx]),
+                                LedEffect::Neon => (0x03, BRIGHTNESS_LUT[bri_idx]),
+                                LedEffect::Streaming => (0x04, BRIGHTNESS_LUT[bri_idx]),
+                                LedEffect::Off => (0x04, 0x00),
                             };
-                            let mut rate_pkt = [0u8; 9];
-                            rate_pkt[0] = 0x06;
-                            rate_pkt[1] = 0x03;
-                            rate_pkt[2] = rate_pkt_val;
-                            let _ = dev.send_feature_report(&rate_pkt);
 
-                            // Packet C: Set Active DPI Stage
-                            let mut dpi_pkt = [0u8; 9];
-                            dpi_pkt[0] = 0x06;
-                            dpi_pkt[1] = 0x04;
-                            dpi_pkt[2] = (profile.current_stage as u8).max(1);
-                            let _ = dev.send_feature_report(&dpi_pkt);
+                            let mut main_rgb = [0u8; 7];
+                            main_rgb[0] = profile.led_color[0]; // Red
+                            main_rgb[1] = profile.led_color[1]; // Green
+                            main_rgb[2] = profile.led_color[2]; // Blue
+                            main_rgb[3] = hw_spd;               // Speed LUT
+                            main_rgb[4] = hw_effect;            // Effect hardware code
+                            main_rgb[5] = hw_bri;               // Brightness LUT
+                            let mut rgb_sum = 0u8;
+                            for b in &main_rgb[0..6] {
+                                rgb_sum = rgb_sum.wrapping_add(*b);
+                            }
+                            main_rgb[6] = (0x55u8).wrapping_sub(rgb_sum);
+                            let _ = write_mouse_eeprom(&dev, 0x00A0, &main_rgb);
+                            std::thread::sleep(std::time::Duration::from_millis(30));
 
+                            // 3. Set DPI Stages & Active Stage (EEPROM Addr 0x0054, 8 bytes)
+                            on_progress(0.55, "Calibrating Sensor DPI Stages...");
+                            let mut dpi_stages_data = [0u8; 8];
+                            for (idx, stage) in profile.dpi_stages.iter().enumerate().take(5) {
+                                dpi_stages_data[idx] = (stage.x / 100).clamp(1, 100) as u8;
+                            }
+                            dpi_stages_data[5] = (profile.current_stage as u8).saturating_sub(1);
+                            dpi_stages_data[6] = 0x00;
+                            let mut dpi_sum = 0u8;
+                            for b in &dpi_stages_data[0..7] {
+                                dpi_sum = dpi_sum.wrapping_add(*b);
+                            }
+                            dpi_stages_data[7] = (0x55u8).wrapping_sub(dpi_sum);
+                            let _ = write_mouse_eeprom(&dev, 0x0054, &dpi_stages_data);
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+
+                            // 4. Set Logo RGB (EEPROM Addr 0x0058, 2 bytes)
+                            on_progress(0.68, "Updating Logo LED...");
+                            let logo_effect = match profile.dpi_effect {
+                                DpiEffect::Steady => 0x01,
+                                DpiEffect::Respiration => 0x02,
+                                DpiEffect::Off => 0x00,
+                            };
+                            let logo_chk = (0x55u8).wrapping_sub(logo_effect);
+                            let logo_data = [logo_effect, logo_chk];
+                            let _ = write_mouse_eeprom(&dev, 0x0058, &logo_data);
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+
+                            // 5. Set DPI Stage Colors (EEPROM Addr 0x004C, 6 bytes)
+                            on_progress(0.78, "Saving DPI Stage Indicators...");
+                            let mut dpi_colors = [0u8; 6];
+                            for (idx, stage) in profile.dpi_stages.iter().enumerate().take(5) {
+                                dpi_colors[idx] = stage.color_rgb[0]; // Stage color identifier
+                            }
+                            let mut color_sum = 0u8;
+                            for b in &dpi_colors[0..5] {
+                                color_sum = color_sum.wrapping_add(*b);
+                            }
+                            dpi_colors[5] = (0x55u8).wrapping_sub(color_sum);
+                            let _ = write_mouse_eeprom(&dev, 0x004C, &dpi_colors);
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+
+                            // 6. Set Button Matrix (EEPROM Addr 0x0060..0x007F, 8 buttons * 4 bytes)
+                            on_progress(0.88, "Writing Hardware Button Matrix...");
+                            for (idx, b_action) in profile.button_actions.iter().enumerate().take(8) {
+                                let (b0, b1, b2): (u8, u8, u8) = match b_action.as_str() {
+                                    "Left button" => (0x01, 0x01, 0x00),
+                                    "Right button" => (0x01, 0x02, 0x00),
+                                    "Middle button" => (0x01, 0x04, 0x00),
+                                    "Forward" => (0x01, 0x10, 0x00),
+                                    "Back" => (0x01, 0x08, 0x00),
+                                    "Fire key" => (0x07, 0x00, 0x00),
+                                    "DPI +" => (0x04, 0x32, 0x02),
+                                    "DPI -" => (0x04, 0x32, 0x03),
+                                    "RGB ON/OFF" | "RGB Switch" => (0x04, 0x32, 0x05),
+                                    "Disable" => (0x05, 0x00, 0x00),
+                                    _ => (0x01, 0x01, 0x00),
+                                };
+                                let btn_chk = (0x55u8).wrapping_sub(b0.wrapping_add(b1).wrapping_add(b2));
+                                let btn_chunk = [b0, b1, b2, btn_chk];
+                                let btn_addr = 0x0060 + (idx as u16 * 4);
+                                let _ = write_mouse_eeprom(&dev, btn_addr, &btn_chunk);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+
+                            // 7. COMMIT & FLASH SAVE: SendCMD(0x09, 0x00) followed by SendCMD(0x02, 0x00)
+                            on_progress(0.96, "Committing to Mouse Flash Memory...");
+                            let _ = send_mouse_cmd(&dev, 0x09, 0x00);
+                            std::thread::sleep(std::time::Duration::from_millis(40));
+                            let _ = send_mouse_cmd(&dev, 0x02, 0x00);
+
+                            on_progress(1.0, "Configuration Applied Successfully!");
                             delivered = true;
                         }
                     }

@@ -5,7 +5,11 @@ mod hardware;
 use std::fs;
 use std::time::Instant;
 use eframe::egui;
-use hardware::{parse_jmk_bytes, DpiEffect, HardwareBridge, LedEffect, MacroItem, MouseProfile, PollingRate};
+use hardware::{parse_jmk_bytes, DpiEffect, HardwareBridge, LedEffect, MacroItem, MouseProfile, PollingRate, DEFAULT_PID_WIRED, DEFAULT_PID_WIRELESS};
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem, MenuId},
+    Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
+};
 
 const MOUSE_PNG_BYTES: &[u8] = include_bytes!("../assets/mouse.png");
 const LOGO_PNG_BYTES: &[u8] = include_bytes!("../assets/logo.png");
@@ -37,6 +41,125 @@ enum ThemeMode {
     Light,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum LogLevel {
+    Info,
+    Success,
+    Warn,
+    Error,
+    Status,
+}
+
+#[derive(Clone)]
+struct LogEntry {
+    time: String,
+    level: LogLevel,
+    message: String,
+}
+
+#[cfg(windows)]
+fn trim_memory() {
+    extern "system" {
+        fn SetProcessWorkingSetSize(
+            h_process: *mut std::ffi::c_void,
+            min_size: usize,
+            max_size: usize,
+        ) -> i32;
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    }
+    unsafe {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(not(windows))]
+fn trim_memory() {}
+
+fn is_autostart_enabled() -> bool {
+    let output = std::process::Command::new("reg")
+        .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "RedragonInvaderPro"])
+        .output();
+    matches!(output, Ok(o) if o.status.success())
+}
+
+fn set_autostart(enable: bool) {
+    if enable {
+        if let Ok(exe) = std::env::current_exe() {
+            let path_str = exe.to_string_lossy().to_string();
+            let _ = std::process::Command::new("reg")
+                .args([
+                    "add",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                    "/v",
+                    "RedragonInvaderPro",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &format!("\"{}\"", path_str),
+                    "/f",
+                ])
+                .output();
+        }
+    } else {
+        let _ = std::process::Command::new("reg")
+            .args([
+                "delete",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "RedragonInvaderPro",
+                "/f",
+            ])
+            .output();
+    }
+}
+
+fn build_tray() -> (Option<TrayIcon>, Option<MenuId>, Option<MenuId>, Option<MenuId>) {
+    let menu = Menu::new();
+    let item_show = MenuItem::new("Show Redragon Suite", true, None);
+    let item_hide = MenuItem::new("Hide to Tray", true, None);
+    let item_quit = MenuItem::new("Quit", true, None);
+
+    let id_show = item_show.id().clone();
+    let id_hide = item_hide.id().clone();
+    let id_quit = item_quit.id().clone();
+
+    let _ = menu.append(&item_show);
+    let _ = menu.append(&item_hide);
+    let _ = menu.append(&item_quit);
+
+    let icon = if let Ok(img) = image::load_from_memory(LOGO_PNG_BYTES) {
+        let rgba = img.resize_exact(32, 32, image::imageops::FilterType::Lanczos3).to_rgba8();
+        let (w, h) = (rgba.width(), rgba.height());
+        Icon::from_rgba(rgba.into_raw(), w, h).ok()
+    } else {
+        None
+    };
+
+    if let Some(ic) = icon {
+        let tray = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("Redragon INVADER PRO Suite")
+            .with_icon(ic)
+            .build()
+            .ok();
+
+        // Spawn a dedicated listener thread for Quit menu event so clicking "Quit" in tray terminates
+        // immediately even if the window is hidden and GUI repainting is paused by the OS.
+        let quit_id = id_quit.clone();
+        std::thread::spawn(move || {
+            while let Ok(menu_event) = MenuEvent::receiver().recv() {
+                if menu_event.id == quit_id {
+                    std::process::exit(0);
+                }
+            }
+        });
+
+        (tray, Some(id_show), Some(id_hide), Some(id_quit))
+    } else {
+        (None, None, None, None)
+    }
+}
+
 struct RedragonApp {
     bridge: HardwareBridge,
     profiles: Vec<MouseProfile>,
@@ -62,6 +185,50 @@ struct RedragonApp {
     insert_event_param: String,
     // Custom color picker state
     temp_custom_color: [u8; 3],
+    // Logs state
+    logs: Vec<LogEntry>,
+    auto_scroll_logs: bool,
+    // Previous hardware state for change detection logging
+    prev_connected: bool,
+    prev_charging: bool,
+    prev_wireless: bool,
+    // Background and Autostart
+    minimize_to_tray: bool,
+    autostart_with_windows: bool,
+    _tray: Option<TrayIcon>,
+    tray_show_id: Option<MenuId>,
+    tray_hide_id: Option<MenuId>,
+    tray_quit_id: Option<MenuId>,
+    // Apply progress worker state
+    apply_rx: Option<std::sync::mpsc::Receiver<(f32, String)>>,
+    apply_progress: Option<(f32, String)>,
+    // DPI switch floating overlay (toast)
+    dpi_toast_time: Option<Instant>,
+    dpi_toast_stage: usize,
+    dpi_toast_val: u32,
+    dpi_toast_color: egui::Color32,
+}
+
+impl RedragonApp {
+    fn add_log(&mut self, level: LogLevel, msg: impl Into<String>) {
+        let message = msg.into();
+        let time = chrono::Local::now().format("%H:%M:%S").to_string();
+        self.logs.push(LogEntry {
+            time,
+            level,
+            message,
+        });
+        if self.logs.len() > 600 {
+            self.logs.remove(0);
+        }
+    }
+
+    fn show_dpi_toast(&mut self, stage: usize, dpi: u32, color_rgb: [u8; 3]) {
+        self.dpi_toast_time = Some(Instant::now());
+        self.dpi_toast_stage = stage;
+        self.dpi_toast_val = dpi;
+        self.dpi_toast_color = egui::Color32::from_rgb(color_rgb[0], color_rgb[1], color_rgb[2]);
+    }
 }
 
 impl Default for RedragonApp {
@@ -103,8 +270,15 @@ impl Default for RedragonApp {
             },
         ];
 
-        Self {
-            bridge: HardwareBridge::new(),
+        let autostart = is_autostart_enabled();
+        let (tray, id_show, id_hide, id_quit) = build_tray();
+        let bridge = HardwareBridge::new();
+        let conn = bridge.connected;
+        let charg = bridge.is_charging;
+        let wire = bridge.is_wireless;
+
+        let mut app = Self {
+            bridge,
             profiles,
             active_profile_idx: 0,
             current_tab: AppTab::Main,
@@ -126,18 +300,151 @@ impl Default for RedragonApp {
             insert_event_type: "Delay (ms)".to_string(),
             insert_event_param: "50".to_string(),
             temp_custom_color: [27, 94, 32],
+            logs: Vec::new(),
+            auto_scroll_logs: true,
+            prev_connected: conn,
+            prev_charging: charg,
+            prev_wireless: wire,
+            minimize_to_tray: true,
+            autostart_with_windows: autostart,
+            _tray: tray,
+            tray_show_id: id_show,
+            tray_hide_id: id_hide,
+            tray_quit_id: id_quit,
+            apply_rx: None,
+            apply_progress: None,
+            dpi_toast_time: None,
+            dpi_toast_stage: 1,
+            dpi_toast_val: 1000,
+            dpi_toast_color: egui::Color32::from_rgb(0, 255, 255),
+        };
+
+        app.add_log(LogLevel::Info, "Redragon Invader Pro Suite initialized.");
+        if app.bridge.connected {
+            let mode = if app.bridge.is_charging {
+                "USB Charging"
+            } else if app.bridge.is_wireless {
+                "Wireless 2.4G"
+            } else {
+                "Wired USB"
+            };
+            app.add_log(LogLevel::Status, format!("Device detected: {} [{}] (Battery: {}%)", app.bridge.device_name, mode, app.bridge.battery_percent));
+        } else if app.bridge.found_dongle {
+            app.add_log(LogLevel::Warn, format!("2.4G USB Receiver connected (PID 0x{:04X}), but mouse is not responding: verify mouse switch is ON underneath or wake up mouse from sleep.", app.bridge.pid));
+        } else {
+            app.add_log(LogLevel::Warn, format!("No Redragon USB device found: neither 2.4G dongle (PID 0x{:04X}) nor wired USB cable (PID 0x{:04X}) detected on system USB bus.", DEFAULT_PID_WIRELESS, DEFAULT_PID_WIRED));
         }
+
+        if autostart {
+            app.add_log(LogLevel::Info, "System auto-start on boot is active.");
+        }
+
+        app
     }
 }
 
 impl eframe::App for RedragonApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Automatic background polling of USB bus every 1.5 seconds
-        if self.last_poll_time.elapsed().as_millis() > 1500 {
+        // Handle Tray Icon Events
+        if let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            match event {
+                TrayIconEvent::Click { button: tray_icon::MouseButton::Left, .. } | TrayIconEvent::DoubleClick { .. } => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                _ => {}
+            }
+        }
+
+        // Handle Tray Menu Events
+        if let Ok(menu_event) = MenuEvent::receiver().try_recv() {
+            if Some(&menu_event.id) == self.tray_show_id.as_ref() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            } else if Some(&menu_event.id) == self.tray_hide_id.as_ref() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                trim_memory();
+            } else if Some(&menu_event.id) == self.tray_quit_id.as_ref() {
+                std::process::exit(0);
+            }
+        }
+
+        // Process Apply Background Worker Channel
+        if let Some(rx) = &self.apply_rx {
+            while let Ok((pct, msg)) = rx.try_recv() {
+                if pct < 0.0 {
+                    // Error encountered
+                    self.status_msg = msg.clone();
+                    self.add_log(LogLevel::Error, format!("Hardware sync failure: {}", msg));
+                    self.apply_progress = None;
+                    self.apply_rx = None;
+                    break;
+                } else if pct >= 1.0 {
+                    // Complete
+                    self.status_msg = msg.clone();
+                    let active = &self.profiles[self.active_profile_idx];
+                    let current_dpi = active.dpi_stages.get(active.current_stage.saturating_sub(1)).map(|s| s.x).unwrap_or(1000);
+                    self.add_log(LogLevel::Success, format!(
+                        "Profile {} written to mouse EEPROM (LED: {:?}, Polling: {:?}, DPI: {}).",
+                        self.active_profile_idx + 1,
+                        active.led_effect,
+                        active.polling_rate,
+                        current_dpi
+                    ));
+                    self.apply_progress = None;
+                    self.apply_rx = None;
+                    break;
+                } else {
+                    // Progress update
+                    self.apply_progress = Some((pct, msg));
+                }
+            }
+        }
+        if self.apply_progress.is_some() {
+            ctx.request_repaint();
+        }
+
+        // Intercept window close button if minimize to tray is enabled
+        if self.minimize_to_tray && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            trim_memory();
+            self.add_log(LogLevel::Info, "Application minimized to system tray notification area.");
+        }
+
+        // Automatic background polling of USB bus every 800ms
+        if self.last_poll_time.elapsed().as_millis() > 800 {
+            self.last_poll_time = std::time::Instant::now();
             self.bridge.detect();
             self.profiles[self.active_profile_idx].battery_percent = self.bridge.battery_percent;
+            ctx.request_repaint();
+
+            // Log status transitions
+            if self.bridge.connected != self.prev_connected
+                || self.bridge.is_charging != self.prev_charging
+                || self.bridge.is_wireless != self.prev_wireless
+            {
+                if self.bridge.connected {
+                    if self.bridge.is_charging {
+                        self.add_log(LogLevel::Status, format!("Mouse plugged in: Charging via USB (Battery: {}%)", self.bridge.battery_percent));
+                    } else if self.bridge.is_wireless {
+                        self.add_log(LogLevel::Status, format!("Mouse connected via Wireless 2.4G receiver (Battery: {}%)", self.bridge.battery_percent));
+                    } else {
+                        self.add_log(LogLevel::Status, format!("Mouse connected via Wired USB (Battery: {}%)", self.bridge.battery_percent));
+                    }
+                } else if self.bridge.found_dongle {
+                    self.add_log(LogLevel::Warn, "Mouse link lost: 2.4G receiver is plugged in, but mouse switch was turned OFF or entered standby sleep.");
+                } else {
+                    self.add_log(LogLevel::Warn, "Mouse disconnected: USB device unplugged from PC.");
+                }
+                self.prev_connected = self.bridge.connected;
+                self.prev_charging = self.bridge.is_charging;
+                self.prev_wireless = self.bridge.is_wireless;
+            }
+
             self.last_poll_time = Instant::now();
         }
+        ctx.request_repaint_after(std::time::Duration::from_millis(800));
 
         // Embed & Load genuine mouse image texture
         if self.mouse_texture.is_none() {
@@ -156,6 +463,7 @@ impl eframe::App for RedragonApp {
                 let (w, h) = (image.width() as usize, image.height() as usize);
                 let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &image.into_raw());
                 self.logo_texture = Some(ctx.load_texture("logo_view", color_image, egui::TextureOptions::LINEAR));
+                trim_memory();
             }
         }
 
@@ -170,15 +478,21 @@ impl eframe::App for RedragonApp {
                             let elapsed = now.duration_since(self.last_record_event_time).as_millis();
                             self.last_record_event_time = now;
 
+                            let mut recorded_evt = None;
                             if let Some(m) = self.macros.get_mut(self.selected_macro_idx) {
                                 if self.auto_record_delay && elapsed > 5 && elapsed < 10000 {
                                     m.key_events.push(format!("Delay: {}ms", elapsed));
                                 }
                                 if pressed {
                                     m.key_events.push(format!("Key Down: {:?}", key));
+                                    recorded_evt = Some((m.name.clone(), format!("Key Down: {:?}", key)));
                                 } else {
                                     m.key_events.push(format!("Key Up: {:?}", key));
+                                    recorded_evt = Some((m.name.clone(), format!("Key Up: {:?}", key)));
                                 }
+                            }
+                            if let Some((name, evt)) = recorded_evt {
+                                self.add_log(LogLevel::Info, format!("Macro '{}' recorded: {}", name, evt));
                             }
                         }
                     }
@@ -243,6 +557,8 @@ impl eframe::App for RedragonApp {
                             } else {
                                 (egui::Color32::from_rgb(0, 200, 255), "🔌 Wired USB")
                             }
+                        } else if self.bridge.is_wireless {
+                            (egui::Color32::from_rgb(220, 50, 50), "💤 Off / Standby")
                         } else {
                             (egui::Color32::from_rgb(220, 50, 50), "Disconnected")
                         };
@@ -252,7 +568,6 @@ impl eframe::App for RedragonApp {
                         ui.painter().circle_filled(rect.center(), 5.0, dot_color);
                         ui.label(egui::RichText::new(mode_text).color(dot_color).size(12.0).strong());
                     });
-                    ctx.request_repaint();
                 });
 
                 ui.add_space(14.0);
@@ -305,6 +620,7 @@ impl eframe::App for RedragonApp {
                                     if let Ok(prof) = serde_json::from_str::<MouseProfile>(&json_str) {
                                         self.profiles[self.active_profile_idx] = prof;
                                         self.status_msg = "Profile loaded from JSON!".to_string();
+                                        self.add_log(LogLevel::Success, format!("Profile loaded from JSON file: {:?}", path.file_name().unwrap_or_default()));
                                         imported = true;
                                     }
                                 }
@@ -312,11 +628,13 @@ impl eframe::App for RedragonApp {
                                     if let Some(loaded_jmk) = parse_jmk_bytes(&bytes) {
                                         self.profiles[self.active_profile_idx] = loaded_jmk;
                                         self.status_msg = "Original JMK profile loaded successfully!".to_string();
+                                        self.add_log(LogLevel::Success, format!("Original JMK binary profile loaded: {:?}", path.file_name().unwrap_or_default()));
                                         imported = true;
                                     }
                                 }
                                 if !imported {
                                     self.status_msg = "Unrecognized profile format.".to_string();
+                                    self.add_log(LogLevel::Error, "Failed to parse imported profile file format.");
                                 }
                             }
                         }
@@ -328,8 +646,9 @@ impl eframe::App for RedragonApp {
                             .add_filter("JSON Profile", &["json"])
                             .save_file() {
                             let json = serde_json::to_string_pretty(&self.profiles[self.active_profile_idx]).unwrap_or_default();
-                            let _ = fs::write(path, json);
+                            let _ = fs::write(&path, json);
                             self.status_msg = "Profile exported!".to_string();
+                            self.add_log(LogLevel::Success, format!("Active Profile {} exported to JSON: {:?}", self.active_profile_idx + 1, path.file_name().unwrap_or_default()));
                         }
                     }
 
@@ -338,19 +657,45 @@ impl eframe::App for RedragonApp {
                     if ui.button("Restore").clicked() {
                         self.profiles[self.active_profile_idx] = MouseProfile::default();
                         self.status_msg = "Reset to default profile.".to_string();
+                        self.add_log(LogLevel::Info, format!("Profile {} restored to factory default parameters.", self.active_profile_idx + 1));
                     }
 
-                    let apply_btn = egui::Button::new(egui::RichText::new("Apply").color(egui::Color32::WHITE).strong())
-                        .fill(accent);
-                    if ui.add(apply_btn).clicked() {
-                        match self.bridge.apply_profile(&self.profiles[self.active_profile_idx], self.active_profile_idx) {
-                            Ok(_) => self.status_msg = "Settings applied to mouse EEPROM & hardware!".to_string(),
-                            Err(e) => self.status_msg = format!("Apply error: {}", e),
-                        }
+                    let is_applying = self.apply_progress.is_some();
+                    let apply_btn = egui::Button::new(
+                        egui::RichText::new(if is_applying { "Applying..." } else { "Apply" })
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    ).fill(if is_applying { egui::Color32::from_rgb(100, 100, 100) } else { accent });
+
+                    if ui.add_enabled(!is_applying, apply_btn).clicked() {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        self.apply_rx = Some(rx);
+                        self.apply_progress = Some((0.05, "Initializing hardware sync...".to_string()));
+                        self.status_msg = "Applying settings to mouse...".to_string();
+
+                        let profile_to_apply = self.profiles[self.active_profile_idx].clone();
+                        let active_idx = self.active_profile_idx;
+                        let vid = self.bridge.vid;
+
+                        std::thread::spawn(move || {
+                            let tx_cb = tx.clone();
+                            let res = HardwareBridge::apply_profile_direct(vid, &profile_to_apply, active_idx, move |pct, step| {
+                                let _ = tx_cb.send((pct, step.to_string()));
+                            });
+                            match res {
+                                Ok(_) => {
+                                    let _ = tx.send((1.0, "SUCCESS: Settings saved to hardware EEPROM!".to_string()));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send((-1.0, format!("ERROR: {}", e)));
+                                }
+                            }
+                        });
                     }
 
                     if ui.button("Cancel").clicked() {
                         self.status_msg = "Operation cancelled.".to_string();
+                        self.add_log(LogLevel::Info, "Changes cancelled by user.");
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -360,6 +705,7 @@ impl eframe::App for RedragonApp {
             });
 
         // 3. MAIN CENTER WORKSPACE
+        let mut switched_dpi_stage = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             let active_profile = &mut self.profiles[self.active_profile_idx];
 
@@ -383,7 +729,6 @@ impl eframe::App for RedragonApp {
                     // MOUSE VIEW WITH DYNAMIC HIGHLIGHT PINS ON MOUSE IMAGE
                     ui.vertical_centered(|ui| {
                         if let Some(texture) = &self.mouse_texture {
-                            // Native aspect ratio for 382 x 263
                             let mouse_size = egui::vec2(340.0, 234.0);
                             let (rect, _resp) = ui.allocate_exact_size(mouse_size, egui::Sense::hover());
                             ui.painter().image(
@@ -461,7 +806,9 @@ impl eframe::App for RedragonApp {
                                 .selected_text(&active_profile.button_actions[b_idx])
                                 .show_ui(ui, |ui| {
                                     for action in available_actions.iter() {
-                                        ui.selectable_value(&mut active_profile.button_actions[b_idx], action.to_string(), *action);
+                                        if ui.selectable_value(&mut active_profile.button_actions[b_idx], action.to_string(), *action).clicked() {
+                                            // Action changed
+                                        }
                                     }
                                 });
                         });
@@ -530,7 +877,6 @@ impl eframe::App for RedragonApp {
                                     .size(12.0)
                                     .strong());
                             }
-                            ctx.request_repaint();
                         });
                     });
                 }
@@ -556,21 +902,36 @@ impl eframe::App for RedragonApp {
                         });
                         ui.add_space(6.0);
 
+                        let mut stage_click = None;
                         for (idx, stage) in active_profile.dpi_stages.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
-                                ui.checkbox(&mut stage.enabled, format!("Stage {}", idx + 1));
+                                let is_current = active_profile.current_stage == (idx + 1);
+                                if ui.selectable_label(is_current, format!("Stage {}", idx + 1)).clicked() {
+                                    stage_click = Some((idx + 1, stage.x, stage.color_rgb));
+                                }
+
+                                ui.checkbox(&mut stage.enabled, "");
 
                                 let mut c = egui::Color32::from_rgb(stage.color_rgb[0], stage.color_rgb[1], stage.color_rgb[2]);
                                 if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
                                     stage.color_rgb = [c.r(), c.g(), c.b()];
                                 }
 
-                                ui.add_sized([300.0, 18.0], egui::Slider::new(&mut stage.x, 100..=10000).step_by(100.0));
+                                if ui.add_sized([300.0, 18.0], egui::Slider::new(&mut stage.x, 100..=10000).step_by(100.0)).changed() {
+                                    if is_current {
+                                        stage_click = Some((idx + 1, stage.x, stage.color_rgb));
+                                    }
+                                }
                                 stage.y = stage.x;
 
                                 ui.label(egui::RichText::new(format!("{} DPI", stage.x)).color(accent).strong());
                             });
                             ui.add_space(4.0);
+                        }
+
+                        if let Some((stg, dpi_val, clr)) = stage_click {
+                            active_profile.current_stage = stg;
+                            switched_dpi_stage = Some((stg, dpi_val, clr));
                         }
 
                         ui.add_space(14.0);
@@ -633,22 +994,25 @@ impl eframe::App for RedragonApp {
                                 ui.add(egui::TextEdit::singleline(&mut self.new_macro_name).desired_width(110.0));
                                 if ui.button("+ New").clicked() {
                                     if !self.new_macro_name.trim().is_empty() {
+                                        let name = self.new_macro_name.trim().to_string();
                                         self.macros.push(MacroItem {
-                                            name: self.new_macro_name.trim().to_string(),
+                                            name: name.clone(),
                                             key_events: Vec::new(),
                                         });
                                         self.selected_macro_idx = self.macros.len() - 1;
                                         self.selected_key_event_idx = None;
                                         self.new_macro_name.clear();
+                                        self.add_log(LogLevel::Info, format!("Created new macro profile '{}'", name));
                                     }
                                 }
                                 if ui.button("Delete").clicked() {
                                     if !self.macros.is_empty() && self.selected_macro_idx < self.macros.len() {
-                                        self.macros.remove(self.selected_macro_idx);
+                                        let removed = self.macros.remove(self.selected_macro_idx);
                                         if self.selected_macro_idx > 0 {
                                             self.selected_macro_idx -= 1;
                                         }
                                         self.selected_key_event_idx = None;
+                                        self.add_log(LogLevel::Info, format!("Deleted macro '{}'", removed.name));
                                     }
                                 }
                             });
@@ -689,12 +1053,22 @@ impl eframe::App for RedragonApp {
                                 if ui.add(rec_btn).clicked() {
                                     self.macro_recording = !self.macro_recording;
                                     self.last_record_event_time = Instant::now();
+                                    if self.macro_recording {
+                                        self.add_log(LogLevel::Info, "Macro recorder started (listening for keys)...");
+                                    } else {
+                                        self.add_log(LogLevel::Info, "Macro recording stopped.");
+                                    }
                                 }
 
                                 if ui.button("Clear").clicked() {
+                                    let mut cleared_name = None;
                                     if let Some(m) = self.macros.get_mut(self.selected_macro_idx) {
                                         m.key_events.clear();
-                                        self.selected_key_event_idx = None;
+                                        cleared_name = Some(m.name.clone());
+                                    }
+                                    self.selected_key_event_idx = None;
+                                    if let Some(name) = cleared_name {
+                                        self.add_log(LogLevel::Info, format!("Cleared events in macro '{}'", name));
                                     }
                                 }
 
@@ -702,8 +1076,9 @@ impl eframe::App for RedragonApp {
                                     if let Some(m) = self.macros.get_mut(self.selected_macro_idx) {
                                         if let Some(idx) = self.selected_key_event_idx {
                                             if idx < m.key_events.len() {
-                                                m.key_events.remove(idx);
+                                                let del = m.key_events.remove(idx);
                                                 self.selected_key_event_idx = None;
+                                                self.add_log(LogLevel::Info, format!("Removed event '{}'", del));
                                             }
                                         }
                                     }
@@ -741,12 +1116,17 @@ impl eframe::App for RedragonApp {
                                             _ => format!("{}: {}", self.insert_event_type, self.insert_event_param.trim()),
                                         };
 
+                                        let mut inserted_info = None;
                                         if let Some(m) = self.macros.get_mut(self.selected_macro_idx) {
                                             if let Some(idx) = self.selected_key_event_idx {
-                                                m.key_events.insert(idx.min(m.key_events.len()), evt_str);
+                                                m.key_events.insert(idx.min(m.key_events.len()), evt_str.clone());
                                             } else {
-                                                m.key_events.push(evt_str);
+                                                m.key_events.push(evt_str.clone());
                                             }
+                                            inserted_info = Some((evt_str, m.name.clone()));
+                                        }
+                                        if let Some((evt, name)) = inserted_info {
+                                            self.add_log(LogLevel::Info, format!("Inserted event '{}' into macro '{}'", evt, name));
                                         }
                                     }
                                 });
@@ -878,8 +1258,8 @@ impl eframe::App for RedragonApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.label("Theme Mode:");
-                            ui.radio_value(&mut self.theme, ThemeMode::Dark, "🌙 Dark Theme (#101010 OLED)");
-                            ui.radio_value(&mut self.theme, ThemeMode::Light, "☀ Light Theme");
+                            ui.radio_value(&mut self.theme, ThemeMode::Dark, "Dark Theme");
+                            ui.radio_value(&mut self.theme, ThemeMode::Light, "Light Theme");
                         });
 
                         ui.add_space(10.0);
@@ -914,32 +1294,281 @@ impl eframe::App for RedragonApp {
                         });
                     });
 
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
+                    // System Tray & Windows Autostart Options
+                    ui.group(|ui| {
+                        ui.heading("System & Background Execution");
+                        ui.add_space(6.0);
+
+                        ui.checkbox(
+                            &mut self.minimize_to_tray,
+                            "Minimize to System Tray on close (keeps software running in background taskbar)",
+                        );
+
+                        if ui.checkbox(
+                            &mut self.autostart_with_windows,
+                            "Start with Windows (automatically launch on PC boot)",
+                        ).changed() {
+                            set_autostart(self.autostart_with_windows);
+                            if self.autostart_with_windows {
+                                self.add_log(LogLevel::Success, "Enabled auto-start with Windows on system boot (HKCU Run).");
+                            } else {
+                                self.add_log(LogLevel::Info, "Disabled auto-start with Windows.");
+                            }
+                        }
+                    });
+
+                    ui.add_space(10.0);
                     ui.group(|ui| {
                         ui.heading("Hardware Diagnostics");
                         ui.label(format!("Device Model: {}", self.bridge.device_name));
                         ui.label(format!("Vendor ID: 0x{:04X}", self.bridge.vid));
                         ui.label(format!("Product ID: 0x{:04X}", self.bridge.pid));
+                        ui.label(format!("2.4G Receiver Plugged: {}", if self.bridge.found_dongle { "Yes (Dongle PID 0xFA7E found)" } else { "No" }));
+                        ui.label(format!("Wired Cable Plugged: {}", if self.bridge.found_wired { "Yes (Wired PID 0xFAB0 found)" } else { "No" }));
+                        ui.label(format!("RF Link Active (Mouse ON): {}", if self.bridge.handshake_ok { "Yes (MCU responding)" } else { "No (Off/Standby/No RF)" }));
                         ui.label(format!("Connection Bus: {}", if self.bridge.is_wireless { "Wireless 2.4G" } else { "Wired USB" }));
                         ui.label(format!("Battery / Power: {} %", self.bridge.battery_percent));
                         ui.label(format!("Charging State: {}", if self.bridge.is_charging { "Yes (Plugged into USB ⚡)" } else { "No (Battery power)" }));
+                        ui.label(egui::RichText::new(format!("Diagnostic State: {}", self.bridge.last_status_detail)).italics().color(egui::Color32::from_rgb(180, 180, 180)));
                         if ui.button("⟳ Re-probe USB/Wireless Bus").clicked() {
                             self.bridge.detect();
                             self.profiles[self.active_profile_idx].battery_percent = self.bridge.battery_percent;
                             self.status_msg = format!("Bus rescanned: {} (Battery {}%)", self.bridge.device_name, self.bridge.battery_percent);
+                            let lvl = if self.bridge.connected { LogLevel::Success } else { LogLevel::Warn };
+                            self.add_log(lvl, format!("Manual bus probe: {}", self.bridge.last_status_detail));
                         }
+                    });
+
+                    ui.add_space(10.0);
+                    // DEDICATED LOG CONSOLE BOX
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Activity & Hardware Event Log");
+                            ui.label(egui::RichText::new(format!("({} events)", self.logs.len())).color(egui::Color32::from_rgb(160, 160, 160)));
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("🗑 Clear").clicked() {
+                                    self.logs.clear();
+                                }
+                                if ui.button("📋 Copy All").clicked() {
+                                    let mut full_text = String::new();
+                                    for entry in &self.logs {
+                                        let lvl = match entry.level {
+                                            LogLevel::Info => "INFO",
+                                            LogLevel::Success => "SUCCESS",
+                                            LogLevel::Warn => "WARN",
+                                            LogLevel::Error => "ERROR",
+                                            LogLevel::Status => "STATUS",
+                                        };
+                                        full_text.push_str(&format!("[{}] [{}] {}\n", entry.time, lvl, entry.message));
+                                    }
+                                    ui.output_mut(|o| o.copied_text = full_text);
+                                }
+                                if ui.button("💾 Export Log").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .set_file_name("redragon_events.log")
+                                        .add_filter("Log file", &["log", "txt"])
+                                        .save_file() {
+                                        let mut full_text = String::new();
+                                        for entry in &self.logs {
+                                            let lvl = match entry.level {
+                                                LogLevel::Info => "INFO",
+                                                LogLevel::Success => "SUCCESS",
+                                                LogLevel::Warn => "WARN",
+                                                LogLevel::Error => "ERROR",
+                                                LogLevel::Status => "STATUS",
+                                            };
+                                            full_text.push_str(&format!("[{}] [{}] {}\n", entry.time, lvl, entry.message));
+                                        }
+                                        let _ = fs::write(path, full_text);
+                                    }
+                                }
+                                ui.checkbox(&mut self.auto_scroll_logs, "Auto-scroll");
+                            });
+                        });
+
+                        ui.add_space(4.0);
+                        // Terminal Box Frame
+                        let console_bg = if is_dark { egui::Color32::from_rgb(10, 11, 14) } else { egui::Color32::from_rgb(240, 242, 245) };
+                        egui::Frame::none()
+                            .fill(console_bg)
+                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 42, 50)))
+                            .inner_margin(8.0)
+                            .rounding(4.0)
+                            .show(ui, |ui| {
+                                let mut scroll = egui::ScrollArea::vertical()
+                                    .min_scrolled_height(140.0)
+                                    .max_height(170.0);
+                                if self.auto_scroll_logs {
+                                    scroll = scroll.stick_to_bottom(true);
+                                }
+
+                                scroll.show(ui, |ui| {
+                                    if self.logs.is_empty() {
+                                        ui.label(egui::RichText::new("No logged activity yet.").monospace().color(egui::Color32::GRAY));
+                                    } else {
+                                        for entry in &self.logs {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(&entry.time).monospace().color(egui::Color32::from_rgb(120, 120, 130)));
+
+                                                let (tag, tag_clr) = match entry.level {
+                                                    LogLevel::Success => ("[SUCCESS]", egui::Color32::from_rgb(0, 230, 118)),
+                                                    LogLevel::Status => ("[STATUS]", egui::Color32::from_rgb(0, 229, 255)),
+                                                    LogLevel::Info => ("[INFO]", egui::Color32::from_rgb(144, 202, 249)),
+                                                    LogLevel::Warn => ("[WARN]", egui::Color32::from_rgb(255, 179, 0)),
+                                                    LogLevel::Error => ("[ERROR]", egui::Color32::from_rgb(255, 82, 82)),
+                                                };
+                                                ui.label(egui::RichText::new(tag).monospace().strong().color(tag_clr));
+                                                ui.label(egui::RichText::new(&entry.message).monospace().color(text_color));
+                                            });
+                                        }
+                                    }
+                                });
+                            });
                     });
                 }
             }
         });
+
+        if let Some((stg, dpi_val, clr)) = switched_dpi_stage {
+            self.show_dpi_toast(stg, dpi_val, clr);
+            self.add_log(LogLevel::Info, format!("Switched to DPI Stage {} ({} DPI)", stg, dpi_val));
+        }
+
+        // 4. FLOATING OVERLAYS (DPI TOAST & APPLY LOADING MODAL)
+        // A) Apply Progress Modal
+        if let Some((pct, step_text)) = &self.apply_progress {
+            egui::Area::new("apply_progress_modal_area".into())
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_premultiplied(18, 18, 22, 240))
+                        .stroke(egui::Stroke::new(1.5_f32, accent))
+                        .rounding(10.0)
+                        .inner_margin(24.0)
+                        .shadow(egui::epaint::Shadow {
+                            offset: egui::vec2(0.0, 4.0),
+                            blur: 16.0,
+                            spread: 0.0,
+                            color: egui::Color32::from_black_alpha(180),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(340.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new("SYNCING HARDWARE").size(15.0).strong().color(egui::Color32::WHITE));
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new(step_text).size(13.0).color(egui::Color32::from_rgb(200, 200, 210)));
+                                ui.add_space(14.0);
+                                let pbar = egui::ProgressBar::new(*pct)
+                                    .animate(true)
+                                    .fill(accent)
+                                    .show_percentage();
+                                ui.add(pbar);
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("Writing EEPROM registers... Please do not unplug device.").size(10.5).color(egui::Color32::from_rgb(140, 140, 140)));
+                            });
+                        });
+                });
+        }
+
+        // B) Floating DPI Switch Overlay (Left-side toast like original OEM)
+        if let Some(toast_start) = self.dpi_toast_time {
+            let elapsed = toast_start.elapsed().as_secs_f32();
+            if elapsed < 2.5 {
+                let alpha = if elapsed > 1.8 {
+                    ((2.5 - elapsed) / 0.7).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let bg_color = egui::Color32::from_rgba_premultiplied(
+                    (20.0 * alpha) as u8,
+                    (22.0 * alpha) as u8,
+                    (28.0 * alpha) as u8,
+                    (230.0 * alpha) as u8,
+                );
+                let border_color = egui::Color32::from_rgba_premultiplied(
+                    (self.dpi_toast_color.r() as f32 * alpha) as u8,
+                    (self.dpi_toast_color.g() as f32 * alpha) as u8,
+                    (self.dpi_toast_color.b() as f32 * alpha) as u8,
+                    (255.0 * alpha) as u8,
+                );
+
+                egui::Area::new("dpi_toast_overlay".into())
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::LEFT_CENTER, egui::vec2(24.0, 0.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::none()
+                            .fill(bg_color)
+                            .stroke(egui::Stroke::new(1.5_f32, border_color))
+                            .rounding(8.0)
+                            .inner_margin(16.0)
+                            .shadow(egui::epaint::Shadow {
+                                offset: egui::vec2(0.0, 3.0),
+                                blur: 12.0,
+                                spread: 0.0,
+                                color: egui::Color32::from_black_alpha((160.0 * alpha) as u8),
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(170.0);
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                                        ui.painter().circle_filled(rect.center(), 5.0, border_color);
+                                        ui.label(
+                                            egui::RichText::new(format!("DPI STAGE {}", self.dpi_toast_stage))
+                                                .size(13.0)
+                                                .strong()
+                                                .color(border_color),
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("{} DPI", self.dpi_toast_val))
+                                            .size(22.0)
+                                            .strong()
+                                            .color(egui::Color32::from_rgba_premultiplied(
+                                                (255.0 * alpha) as u8,
+                                                (255.0 * alpha) as u8,
+                                                (255.0 * alpha) as u8,
+                                                (255.0 * alpha) as u8,
+                                            )),
+                                    );
+                                    ui.add_space(6.0);
+                                    // 5-segment Stage Visualizer
+                                    ui.horizontal(|ui| {
+                                        for s in 1..=5 {
+                                            let (seg_rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 5.0), egui::Sense::hover());
+                                            let seg_color = if s == self.dpi_toast_stage {
+                                                border_color
+                                            } else {
+                                                egui::Color32::from_rgba_premultiplied(
+                                                    (55.0 * alpha) as u8,
+                                                    (60.0 * alpha) as u8,
+                                                    (70.0 * alpha) as u8,
+                                                    (180.0 * alpha) as u8,
+                                                )
+                                            };
+                                            ui.painter().rect_filled(seg_rect, 2.5, seg_color);
+                                        }
+                                    });
+                                });
+                            });
+                    });
+                ctx.request_repaint();
+            } else {
+                self.dpi_toast_time = None;
+            }
+        }
     }
 }
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 620.0])
-            .with_min_inner_size([840.0, 560.0])
+            .with_inner_size([900.0, 680.0])
+            .with_min_inner_size([840.0, 600.0])
             .with_title("Redragon INVADER PRO (M719RGB-PRO) Suite"),
         ..Default::default()
     };
@@ -948,18 +1577,29 @@ fn main() -> eframe::Result<()> {
         "Redragon INVADER PRO Suite",
         options,
         Box::new(|cc| {
-            // Register Segoe UI Emoji from Windows so all emoji icons render cleanly without [] boxes
+            // Register lightweight Segoe UI and Segoe UI Symbol fonts from Windows (< 1MB each)
             let mut fonts = egui::FontDefinitions::default();
-            if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\seguiemj.ttf") {
+            if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
                 fonts.font_data.insert(
-                    "seguiemj".to_owned(),
+                    "segoeui".to_owned(),
                     egui::FontData::from_owned(font_data),
                 );
                 fonts
                     .families
                     .entry(egui::FontFamily::Proportional)
                     .or_default()
-                    .push("seguiemj".to_owned());
+                    .insert(0, "segoeui".to_owned());
+            }
+            if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
+                fonts.font_data.insert(
+                    "seguisym".to_owned(),
+                    egui::FontData::from_owned(font_data),
+                );
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push("seguisym".to_owned());
             }
             cc.egui_ctx.set_fonts(fonts);
 
