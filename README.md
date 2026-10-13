@@ -121,7 +121,7 @@ Before building the application on Windows, verify that the following tools are 
 Clone the repository and compile the release binary:
 
 ```powershell
-git clone https://github.com/username/redragon-m719-pro.git
+git clone https://github.com/devyat009/redragon-m719-pro.git
 cd redragon-m719-pro
 cargo build --release
 ```

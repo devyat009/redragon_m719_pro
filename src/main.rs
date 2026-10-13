@@ -14,7 +14,8 @@ use tray_icon::{
 };
 
 const MOUSE_PNG_BYTES: &[u8] = include_bytes!("../assets/mouse.png");
-const LOGO_PNG_BYTES: &[u8] = include_bytes!("../assets/logo.png");
+const LOGO_PNG_BYTES: &[u8] = include_bytes!("../assets/logo1.png");
+const APP_ICON_PNG_BYTES: &[u8] = include_bytes!("../assets/logo.png");
 
 // Exact centers of the button circle marks on mouse.png (382 x 263)
 const BUTTON_COORDS: [(f32, f32); 8] = [
@@ -146,7 +147,7 @@ fn build_tray() -> (Option<TrayIcon>, std::sync::mpsc::Receiver<TrayAction>) {
         }
     }));
 
-    let icon = if let Ok(img) = image::load_from_memory(LOGO_PNG_BYTES) {
+    let icon = if let Ok(img) = image::load_from_memory(APP_ICON_PNG_BYTES) {
         let rgba = img.resize_exact(32, 32, image::imageops::FilterType::Lanczos3).to_rgba8();
         let (w, h) = (rgba.width(), rgba.height());
         Icon::from_rgba(rgba.into_raw(), w, h).ok()
@@ -823,9 +824,9 @@ impl eframe::App for RedragonApp {
 
                                 if is_selected {
                                     // Highlight active selected button with prominent glowing ring and fill
-                                    ui.painter().circle_filled(pin_center, 14.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 180));
-                                    ui.painter().circle_stroke(pin_center, 14.5, egui::Stroke::new(2.5_f32, egui::Color32::WHITE));
-                                    ui.painter().circle_stroke(pin_center, 16.5, egui::Stroke::new(1.5_f32, accent));
+                                    ui.painter().circle_filled(pin_center, 13.5, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 210));
+                                    ui.painter().circle_stroke(pin_center, 14.0, egui::Stroke::new(2.2_f32, egui::Color32::WHITE));
+                                    ui.painter().circle_stroke(pin_center, 16.0, egui::Stroke::new(1.5_f32, accent));
                                     ui.painter().text(
                                         pin_center,
                                         egui::Align2::CENTER_CENTER,
@@ -834,8 +835,49 @@ impl eframe::App for RedragonApp {
                                         egui::Color32::WHITE,
                                     );
                                 } else if pin_resp.hovered() {
-                                    // Subtle hover ring
-                                    ui.painter().circle_stroke(pin_center, 13.0, egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(220, 220, 220)));
+                                    // Hovered button: slightly brighter semi-transparent
+                                    let fill = if is_dark {
+                                        egui::Color32::from_rgba_unmultiplied(35, 38, 48, 190)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(220, 225, 235, 210)
+                                    };
+                                    let border = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220);
+                                    let num_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 240);
+                                    ui.painter().circle_filled(pin_center, 11.5, fill);
+                                    ui.painter().circle_stroke(pin_center, 11.5, egui::Stroke::new(1.5_f32, border));
+                                    ui.painter().text(
+                                        pin_center,
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{}", b),
+                                        egui::FontId::proportional(11.0),
+                                        num_color,
+                                    );
+                                } else {
+                                    // Partially visible circle and number as requested
+                                    let fill = if is_dark {
+                                        egui::Color32::from_rgba_unmultiplied(20, 22, 28, 140)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(190, 195, 205, 150)
+                                    };
+                                    let border = if is_dark {
+                                        egui::Color32::from_rgba_unmultiplied(180, 185, 200, 120)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 85, 95, 130)
+                                    };
+                                    let num_color = if is_dark {
+                                        egui::Color32::from_rgba_unmultiplied(210, 215, 225, 160)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(40, 45, 55, 170)
+                                    };
+                                    ui.painter().circle_filled(pin_center, 11.0, fill);
+                                    ui.painter().circle_stroke(pin_center, 11.0, egui::Stroke::new(1.2_f32, border));
+                                    ui.painter().text(
+                                        pin_center,
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{}", b),
+                                        egui::FontId::proportional(11.0),
+                                        num_color,
+                                    );
                                 }
                             }
                         }
@@ -1654,11 +1696,28 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    let app_icon = if let Ok(img) = image::load_from_memory(APP_ICON_PNG_BYTES) {
+        let rgba = img.to_rgba8();
+        let (width, height) = (rgba.width(), rgba.height());
+        Some(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        })
+    } else {
+        None
+    };
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([900.0, 680.0])
+        .with_min_inner_size([840.0, 600.0])
+        .with_title("Redragon INVADER PRO (M719RGB-PRO) Suite");
+    if let Some(icon) = app_icon {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 680.0])
-            .with_min_inner_size([840.0, 600.0])
-            .with_title("Redragon INVADER PRO (M719RGB-PRO) Suite"),
+        viewport,
         ..Default::default()
     };
 

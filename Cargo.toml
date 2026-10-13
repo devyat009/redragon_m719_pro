@@ -22,3 +22,8 @@ windows = { version = "0.58.0", features = [
 ] }
 tray-icon = "0.26.1"
 chrono = "0.4.45"
+
+[build-dependencies]
+winres = "0.1"
+image = { version = "0.25.1", default-features = false, features = ["png", "ico"] }
+
