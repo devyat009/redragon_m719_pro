@@ -1,13 +1,55 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 pub static IS_APPLYING: AtomicBool = AtomicBool::new(false);
 
+pub static NOTIFY_RESPONSE: Mutex<Option<[u8; 64]>> = Mutex::new(None);
+pub static NOTIFY_CONDVAR: Condvar = Condvar::new();
+
+pub fn clear_notify_response() {
+    if let Ok(mut lock) = NOTIFY_RESPONSE.lock() {
+        *lock = None;
+    }
+}
+
+pub fn wait_notify(expected_cmd: u8, timeout: std::time::Duration) -> Result<[u8; 64], String> {
+    let mut lock = NOTIFY_RESPONSE.lock().map_err(|e| e.to_string())?;
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if let Some(pkt) = *lock {
+            if (pkt[0] == 0x09 && pkt[1] == expected_cmd) || (pkt[0] == expected_cmd) {
+                *lock = None;
+                return Ok(pkt);
+            }
+        }
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let (new_lock, _) = NOTIFY_CONDVAR.wait_timeout(lock, remaining).map_err(|e| e.to_string())?;
+        lock = new_lock;
+    }
+    *lock = None;
+    Err(format!("Timeout waiting for response to cmd 0x{:02X}", expected_cmd))
+}
+
 pub const DEFAULT_VID: u16 = 0x25A7;
 pub const DEFAULT_PID_WIRED: u16 = 0xFAB0;
 pub const DEFAULT_PID_WIRELESS: u16 = 0xFA7E;
+
+pub const BUTTON_SLOT_MAP: [usize; 8] = [
+    0,  // Button 1: Left Click (0x0060)
+    1,  // Button 2: Right Click (0x0064)
+    2,  // Button 3: Middle Wheel (0x0068)
+    4,  // Button 4: Forward (0x0070)
+    3,  // Button 5: Back (0x006C)
+    6,  // Button 6: Rapid Fire (0x0078)
+    10, // Button 7: DPI + (0x0088)
+    11, // Button 8: DPI - (0x008C)
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DpiStage {
@@ -30,8 +72,7 @@ pub enum LedEffect {
     Steady = 1,
     Respiration = 2,
     Neon = 3,
-    Streaming = 4,
-    Off = 5,
+    Off = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +235,7 @@ pub fn calc_packet_checksum(pkt: &[u8; 17]) -> u8 {
 }
 
 // Sends a single command (nCmdID, bData) over Report 0x08 on UsagePage 0xFF02 with valid packet checksum.
+#[allow(dead_code)]
 fn send_mouse_cmd(dev: &hidapi::HidDevice, cmd_id: u8, data: u8) -> Result<(), hidapi::HidError> {
     let mut pkt = [0u8; 17];
     pkt[0] = 0x08; // Report ID 0x08
@@ -220,7 +262,7 @@ fn send_mouse_cmd(dev: &hidapi::HidDevice, cmd_id: u8, data: u8) -> Result<(), h
 // Packet: [0x08, 0x01, 0x00, 0x00, 0x00, 0x04, r0, r1, r2, r3, 0, 0, 0, 0, 0, 0, chk]
 // Verified from Wireshark PCAP (Frame 489/491): Secret key PD = [0x05, 0x00, 0x00, 0x00].
 // Reads reply on notify endpoint (Report 0x09) and verifies bytes match expect[].
-pub fn perform_handshake(cmd_dev: &hidapi::HidDevice, notify_dev: &hidapi::HidDevice) -> bool {
+pub fn perform_handshake(cmd_dev: &hidapi::HidDevice, notify_dev: Option<&hidapi::HidDevice>) -> bool {
     let k = [0x05u8, 0x00u8, 0x00u8, 0x00u8]; // Solved secret key PD from live Wireshark USB trace
 
     for _attempt in 0..5 {
@@ -252,25 +294,105 @@ pub fn perform_handshake(cmd_dev: &hidapi::HidDevice, notify_dev: &hidapi::HidDe
         pkt[9] = r3;
         pkt[16] = calc_packet_checksum(&pkt);
 
+        clear_notify_response();
         if cmd_dev.send_feature_report(&pkt).is_ok() {
-            let mut buf = [0u8; 64];
-            if let Ok(n) = notify_dev.read_timeout(&mut buf, 80) {
-                // Reply is Report 0x09, cmd 0x01 in buf[1], with return bytes in buf[6..10]
-                if n >= 10 && buf[0] == 0x09 && buf[1] == 0x01 {
-                    if buf[6] == exp0 && buf[7] == exp1 && buf[8] == exp2 && buf[9] == exp3 {
-                        return true;
+            if let Ok(buf) = wait_notify(0x01, std::time::Duration::from_millis(150)) {
+                if buf[6] == exp0 && buf[7] == exp1 && buf[8] == exp2 && buf[9] == exp3 {
+                    return true;
+                }
+            } else if let Some(notify) = notify_dev {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = notify.read_timeout(&mut buf, 80) {
+                    if n >= 10 && buf[0] == 0x09 && buf[1] == 0x01 {
+                        if buf[6] == exp0 && buf[7] == exp1 && buf[8] == exp2 && buf[9] == exp3 {
+                            return true;
+                        }
                     }
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     false
 }
 
+// Queries connection status (Cmd 0x03)
+pub fn check_connect_status(cmd_dev: &hidapi::HidDevice, notify_dev: Option<&hidapi::HidDevice>) -> bool {
+    let mut pkt = [0u8; 17];
+    pkt[0] = 0x08;
+    pkt[1] = 0x03; // GetConnectStatus
+    pkt[16] = calc_packet_checksum(&pkt); // 0x4A
+
+    clear_notify_response();
+    if cmd_dev.send_feature_report(&pkt).is_ok() {
+        if let Ok(buf) = wait_notify(0x03, std::time::Duration::from_millis(150)) {
+            if buf[5] != 0 || buf[6] != 0 {
+                return true;
+            }
+        } else if let Some(notify) = notify_dev {
+            let mut buf = [0u8; 64];
+            for _ in 0..3 {
+                if let Ok(n) = notify.read_timeout(&mut buf, 80) {
+                    if n >= 7 && buf[0] == 0x09 && buf[1] == 0x03 {
+                        if buf[5] != 0 || buf[6] != 0 {
+                            return true;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+    false
+}
+
+// Queries battery percentage and charging state via Cmd 0x04 (FUN_00410180 / FUN_004434e0)
+// Report 0x08 Cmd 0x04 -> Device responds on Report 0x09: [0x09, 0x04, 0x00, 0x00, 0x00, 0x02, raw_level, charging_flag, 00..., chk]
+pub fn query_mouse_battery(cmd_dev: &hidapi::HidDevice, notify_dev: Option<&hidapi::HidDevice>) -> Result<(u8, bool), String> {
+    clear_notify_response();
+    let mut pkt = [0u8; 17];
+    pkt[0] = 0x08;
+    pkt[1] = 0x04; // Cmd 0x04 Battery / Power query
+    pkt[16] = calc_packet_checksum(&pkt); // 0x49
+
+    cmd_dev.send_feature_report(&pkt).map_err(|e| e.to_string())?;
+
+    if let Ok(buf) = wait_notify(0x04, std::time::Duration::from_millis(250)) {
+        let raw_level = buf[6] & 0x7F;
+        let charging = buf[7] != 0 || (buf[6] & 0x80 != 0);
+        let percent = if raw_level <= 10 {
+            (raw_level * 10).clamp(0, 100)
+        } else {
+            raw_level.clamp(0, 100)
+        };
+        return Ok((percent, charging));
+    }
+
+    if let Some(notify) = notify_dev {
+        let mut buf = [0u8; 64];
+        for _ in 0..3 {
+            if let Ok(n) = notify.read_timeout(&mut buf, 80) {
+                if n >= 8 && buf[0] == 0x09 && buf[1] == 0x04 {
+                    let raw_level = buf[6] & 0x7F;
+                    let charging = buf[7] != 0 || (buf[6] & 0x80 != 0);
+                    let percent = if raw_level <= 10 {
+                        (raw_level * 10).clamp(0, 100)
+                    } else {
+                        raw_level.clamp(0, 100)
+                    };
+                    return Ok((percent, charging));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    Err("Query battery timeout".to_string())
+}
+
 // Reads up to 10 bytes from mouse EEPROM via Cmd 0x08 on UsagePage 0xFF02 (FUN_004438f0).
 // Packet layout verified from PCAP Frame 493: [0x08, 0x08, 0x00, addr_hi, addr_lo, len, ...]
-pub fn read_mouse_eeprom(cmd_dev: &hidapi::HidDevice, notify_dev: &hidapi::HidDevice, addr: u16, len: u8) -> Result<Vec<u8>, String> {
+pub fn read_mouse_eeprom(cmd_dev: &hidapi::HidDevice, notify_dev: Option<&hidapi::HidDevice>, addr: u16, len: u8) -> Result<Vec<u8>, String> {
     let chunk_len = len.min(10);
     let mut pkt = [0u8; 17];
     pkt[0] = 0x08;
@@ -281,17 +403,27 @@ pub fn read_mouse_eeprom(cmd_dev: &hidapi::HidDevice, notify_dev: &hidapi::HidDe
     pkt[5] = chunk_len;
     pkt[16] = calc_packet_checksum(&pkt);
 
+    clear_notify_response();
     cmd_dev.send_feature_report(&pkt).map_err(|e| e.to_string())?;
 
-    let mut buf = [0u8; 64];
-    for _ in 0..5 {
-        if let Ok(n) = notify_dev.read_timeout(&mut buf, 80) {
-            if n >= 6 + (chunk_len as usize) && buf[0] == 0x09 && buf[1] == 0x08 {
-                return Ok(buf[6..6 + (chunk_len as usize)].to_vec());
-            }
+    if let Ok(buf) = wait_notify(0x08, std::time::Duration::from_millis(150)) {
+        if buf.len() >= 6 + (chunk_len as usize) {
+            return Ok(buf[6..6 + (chunk_len as usize)].to_vec());
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
+
+    if let Some(notify) = notify_dev {
+        let mut buf = [0u8; 64];
+        for _ in 0..5 {
+            if let Ok(n) = notify.read_timeout(&mut buf, 80) {
+                if n >= 6 + (chunk_len as usize) && buf[0] == 0x09 && buf[1] == 0x08 {
+                    return Ok(buf[6..6 + (chunk_len as usize)].to_vec());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     Err("ReadEEPROM timeout".to_string())
 }
 
@@ -346,6 +478,7 @@ pub fn send_tell_drv_status(dev: &hidapi::HidDevice) -> Result<(), hidapi::HidEr
 }
 
 // Cmd 0x09: Commit Apply (FUN_00443050(9, 0)) - Note: Not sent during standard Apply in live PCAP
+#[allow(dead_code)]
 pub fn send_commit(dev: &hidapi::HidDevice) -> Result<(), hidapi::HidError> {
     let mut pkt = [0u8; 17];
     pkt[0] = 0x08;
@@ -415,15 +548,13 @@ pub fn start_notification_listener(
 
                 if let Some(dev) = &current_dev {
                     match dev.read_timeout(&mut buf, 150) {
-                        Ok(n) if n >= 8 => {
-                            let (cmd, flags, dpi_raw, prof_raw) = if buf[1] == 0x0A {
+                        Ok(n) if n >= 3 => {
+                            let (cmd, flags, dpi_raw, prof_raw) = if buf[0] == 0x09 {
                                 (buf[1], buf[6], buf[7], buf[8])
                             } else if buf[0] == 0x0A {
                                 (buf[0], buf[5], buf[6], buf[7])
-                            } else if buf[0] == 0x09 {
-                                (buf[1], buf[6], buf[7], buf[8])
                             } else {
-                                (0, 0, 0, 0)
+                                (buf[0], 0, 0, 0)
                             };
 
                             if cmd == 0x0A {
@@ -462,6 +593,12 @@ pub fn start_notification_listener(
                                             ctx.request_repaint();
                                         }
                                     }
+                                }
+                            } else if buf[0] == 0x09 || buf[0] == 0x08 {
+                                // Synchronous command response from device (0x01, 0x03, 0x04, 0x08, etc.)
+                                if let Ok(mut lock) = NOTIFY_RESPONSE.lock() {
+                                    *lock = Some(buf);
+                                    NOTIFY_CONDVAR.notify_all();
                                 }
                             }
                         }
@@ -535,81 +672,67 @@ impl HardwareBridge {
                     } else if device.product_id() == DEFAULT_PID_WIRELESS {
                         found_dongle = true;
                     }
+                }
+            }
 
+            let target_pid = if found_wired {
+                DEFAULT_PID_WIRED
+            } else {
+                DEFAULT_PID_WIRELESS
+            };
+
+            for device in api.device_list() {
+                if device.vendor_id() == DEFAULT_VID && device.product_id() == target_pid {
                     if device.usage_page() == 0xFF02 && dev_cmd.is_none() {
                         dev_cmd = device.open_device(api).ok();
                     }
                     if !self.handshake_ok && device.usage_page() == 0xFF01 && dev_notify.is_none() {
                         dev_notify = device.open_device(api).ok();
                     }
-
-                    // Query live battery from UsagePage 0xFF04 (Report 0x06)
-                    if device.usage_page() == 0xFF04 {
-                        if let Ok(dev) = device.open_device(api) {
-                            let mut buf = [0u8; 9];
-                            buf[0] = 0x06;
-                            if let Ok(n) = dev.get_feature_report(&mut buf) {
-                                if n >= 4 {
-                                    let bat = buf[3];
-                                    if bat > 0 && bat <= 100 {
-                                        live_battery = bat;
-                                        mouse_responsive = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
 
             // Real Hardware Handshake & Connection Verification
             if found_dongle {
-                if !self.handshake_ok {
-                    if let (Some(cmd), Some(notify)) = (&dev_cmd, &dev_notify) {
-                        let mut pkt = [0u8; 17];
-                        pkt[0] = 0x08;
-                        pkt[1] = 0x03; // GetConnectStatus
-                        pkt[16] = calc_packet_checksum(&pkt); // Exact checksum: 0x4A
-
-                        for _ in 0..3 {
-                            if cmd.send_feature_report(&pkt).is_ok() {
-                                let mut buf = [0u8; 64];
-                                if let Ok(n) = notify.read_timeout(&mut buf, 100) {
-                                    if n >= 3 && buf[0] == 0x09 && buf[1] == 0x03 {
-                                        if (n >= 7 && (buf[5] != 0 || buf[6] != 0)) || live_battery > 0 {
-                                            mouse_responsive = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(15));
-                        }
-
-                        if mouse_responsive {
-                            // Authentic challenge/response handshake (Cmd 0x01) - only on initial auth
-                            if perform_handshake(cmd, notify) {
+                if let Some(cmd) = &dev_cmd {
+                    if !self.handshake_ok {
+                        let is_online = check_connect_status(cmd, dev_notify.as_ref());
+                        if is_online {
+                            mouse_responsive = true;
+                            if perform_handshake(cmd, dev_notify.as_ref()) {
                                 handshake_passed = true;
                                 let _ = send_tell_drv_status(cmd);
                             }
                         }
+                    } else {
+                        // Already authenticated and connected
+                        mouse_responsive = true;
+                        handshake_passed = true;
                     }
-                } else {
-                    // Already authenticated and connected: keep responsive as long as dongle is present
-                    mouse_responsive = true;
-                    handshake_passed = true;
                 }
             } else if found_wired {
                 mouse_responsive = true;
-                if !self.handshake_ok {
-                    if let (Some(cmd), Some(notify)) = (&dev_cmd, &dev_notify) {
-                        if perform_handshake(cmd, notify) {
+                if let Some(cmd) = &dev_cmd {
+                    if !self.handshake_ok {
+                        if perform_handshake(cmd, dev_notify.as_ref()) {
                             handshake_passed = true;
                             let _ = send_tell_drv_status(cmd);
                         }
+                    } else {
+                        handshake_passed = true;
                     }
-                } else {
-                    handshake_passed = true;
+                }
+            }
+
+            // Live Battery Query via authentic Cmd 0x04
+            if mouse_responsive {
+                if let Some(cmd) = &dev_cmd {
+                    if let Ok((bat, chg)) = query_mouse_battery(cmd, dev_notify.as_ref()) {
+                        if bat > 0 {
+                            live_battery = bat;
+                            self.is_charging = chg;
+                        }
+                    }
                 }
             }
         }
@@ -638,7 +761,6 @@ impl HardwareBridge {
         } else if found_dongle && mouse_responsive {
             self.connected = true;
             self.is_wireless = true;
-            self.is_charging = false;
             self.vid = DEFAULT_VID;
             self.pid = DEFAULT_PID_WIRELESS;
             self.device_name = "Redragon M719RGB-PRO (Wireless 2.4G)".to_string();
@@ -664,10 +786,12 @@ impl HardwareBridge {
         }
     }
 
+    #[allow(dead_code)]
     pub fn apply_profile(&self, profile: &MouseProfile, profile_index: usize) -> Result<(), String> {
         Self::apply_profile_direct(self.vid, profile, profile_index, |_, _| {})
     }
 
+    #[allow(dead_code)]
     pub fn apply_profile_with_progress<F: Fn(f32, &str)>(&self, profile: &MouseProfile, profile_index: usize, on_progress: F) -> Result<(), String> {
         Self::apply_profile_direct(self.vid, profile, profile_index, on_progress)
     }
@@ -727,42 +851,85 @@ impl HardwareBridge {
                             matrix[8 * 4 + 2] = 0xFE;
                             matrix[8 * 4 + 3] = 0x49;
 
-                            const BUTTON_SLOT_MAP: [usize; 8] = [
-                                0,  // Button 1: Left Click (0x0060)
-                                1,  // Button 2: Right Click (0x0064)
-                                2,  // Button 3: Middle Wheel (0x0068)
-                                4,  // Button 4: Forward (0x0070)
-                                3,  // Button 5: Back (0x006C)
-                                6,  // Button 6: Rapid Fire (0x0078)
-                                10, // Button 7: DPI + (0x0088)
-                                11, // Button 8: DPI - (0x008C)
-                            ];
-
                             for (btn_idx, b_action) in profile.button_actions.iter().enumerate().take(8) {
                                 let slot = BUTTON_SLOT_MAP[btn_idx];
-                                let (b0, b1, b2): (u8, u8, u8) = match b_action.as_str() {
-                                    "Left button" => (0x01, 0x01, 0x00),
-                                    "Right button" => (0x01, 0x02, 0x00),
-                                    "Middle button" => (0x01, 0x04, 0x00),
-                                    "Forward" => (0x01, 0x10, 0x00),
-                                    "Back" => (0x01, 0x08, 0x00),
-                                    "Fire key" | "Rapid Fire" => (0x09, 0x00, 0x00),
-                                    "DPI +" => (0x02, 0x02, 0x00),
-                                    "DPI -" => (0x02, 0x03, 0x00),
-                                    "RGB ON/OFF" | "RGB Switch" => (0x04, 0x32, 0x05),
-                                    "Disable" => (0x00, 0x00, 0x00),
-                                    _ => match btn_idx {
-                                        0 => (0x01, 0x01, 0x00),
-                                        1 => (0x01, 0x02, 0x00),
-                                        2 => (0x01, 0x04, 0x00),
-                                        3 => (0x01, 0x10, 0x00),
-                                        4 => (0x01, 0x08, 0x00),
-                                        5 => (0x09, 0x00, 0x00),
-                                        6 => (0x02, 0x02, 0x00),
-                                        7 => (0x02, 0x03, 0x00),
-                                        _ => (0x00, 0x00, 0x00),
-                                    },
+                                let mut combo_payload: Option<[u8; 10]> = None;
+
+                                let (b0, b1, b2): (u8, u8, u8) = if let Some(code) = multimedia_to_consumer_code(b_action.as_str()) {
+                                    let mut buf = [0u8; 10];
+                                    buf[0] = 2; // 2 events (down, up)
+                                    buf[1] = 0x82; // Consumer Key Down
+                                    buf[2] = (code & 0xFF) as u8;
+                                    buf[3] = (code >> 8) as u8;
+                                    buf[4] = 0x42; // Consumer Key Up
+                                    buf[5] = (code & 0xFF) as u8;
+                                    buf[6] = (code >> 8) as u8;
+                                    let sum: u8 = buf[0..7].iter().fold(0u8, |acc, &x| acc.wrapping_add(x));
+                                    buf[7] = (0x55u8).wrapping_sub(sum);
+                                    combo_payload = Some(buf);
+                                    (0x05, 0x00, 0x00)
+                                } else if b_action.starts_with("Combo:") || b_action.starts_with("Key combination") {
+                                    let (mask, hid) = parse_key_combo(b_action.as_str());
+                                    let mut buf = [0u8; 10];
+                                    let mut idx = 1;
+                                    let mut ev_count = 0u8;
+                                    if mask != 0 {
+                                        buf[idx] = 0x80;
+                                        buf[idx + 1] = mask;
+                                        buf[idx + 2] = 0x00;
+                                        idx += 3;
+                                        ev_count += 1;
+                                    }
+                                    if hid != 0 {
+                                        buf[idx] = 0x81;
+                                        buf[idx + 1] = hid;
+                                        buf[idx + 2] = 0x00;
+                                        idx += 3;
+                                        ev_count += 1;
+                                    }
+                                    buf[0] = ev_count;
+                                    let sum: u8 = buf[0..idx].iter().fold(0u8, |acc, &x| acc.wrapping_add(x));
+                                    buf[idx] = (0x55u8).wrapping_sub(sum);
+                                    combo_payload = Some(buf);
+                                    (0x05, 0x00, 0x00)
+                                } else if b_action.starts_with("Macro") {
+                                    let macro_id = (btn_idx as u8) + 1;
+                                    (0x06, macro_id, 0xFE)
+                                } else {
+                                    match b_action.as_str() {
+                                        "Left button" => (0x01, 0x01, 0x00),
+                                        "Right button" => (0x01, 0x02, 0x00),
+                                        "Middle button" => (0x01, 0x04, 0x00),
+                                        "Forward" => (0x01, 0x10, 0x00),
+                                        "Back" => (0x01, 0x08, 0x00),
+                                        "Three click" => (0x09, 0x00, 0x00),
+                                        "Fire key" | "Rapid Fire" => (0x07, 0x00, 0x00),
+                                        "DPI +" => (0x02, 0x02, 0x00),
+                                        "DPI -" => (0x02, 0x03, 0x00),
+                                        "DPI Loop" => (0x02, 0x01, 0x00),
+                                        "RGB ON/OFF" | "RGB Switch" => (0x04, 0x32, 0x05),
+                                        "Polling rate switch" => (0x08, 0x00, 0x00),
+                                        "Disable" => (0x00, 0x00, 0x00),
+                                        _ => match btn_idx {
+                                            0 => (0x01, 0x01, 0x00),
+                                            1 => (0x01, 0x02, 0x00),
+                                            2 => (0x01, 0x04, 0x00),
+                                            3 => (0x01, 0x10, 0x00),
+                                            4 => (0x01, 0x08, 0x00),
+                                            5 => (0x07, 0x00, 0x00),
+                                            6 => (0x02, 0x02, 0x00),
+                                            7 => (0x02, 0x03, 0x00),
+                                            _ => (0x00, 0x00, 0x00),
+                                        },
+                                    }
                                 };
+
+                                if let Some(payload) = combo_payload {
+                                    let combo_addr = 0x0100 + (slot as u16) * 0x20;
+                                    let _ = write_mouse_eeprom(&dev, combo_addr, &payload);
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                }
+
                                 let btn_chk = (0x55u8).wrapping_sub(b0.wrapping_add(b1).wrapping_add(b2));
                                 matrix[slot * 4] = b0;
                                 matrix[slot * 4 + 1] = b1;
@@ -833,8 +1000,7 @@ impl HardwareBridge {
                                 LedEffect::Steady => (0x02u8, SPEED_LUT[spd_idx], BRIGHTNESS_LUT[bri_idx]),
                                 LedEffect::Respiration => (0x01u8, SPEED_LUT[spd_idx], BRIGHTNESS_LUT[bri_idx]),
                                 LedEffect::Neon => (0x00u8, NEON_SPEED_LUT[spd_idx], BRIGHTNESS_LUT[bri_idx]),
-                                LedEffect::Streaming => (0x04u8, SPEED_LUT[spd_idx], BRIGHTNESS_LUT[bri_idx]),
-                                LedEffect::Off => (0x04u8, SPEED_LUT[spd_idx], 0x00u8),
+                                LedEffect::Off => (0x04u8, 0x00u8, 0x00u8),
                             };
 
                             let mut main_rgb = [0u8; 7];
@@ -852,18 +1018,46 @@ impl HardwareBridge {
                             let _ = write_mouse_eeprom(&dev, 0x00A0, &main_rgb);
                             std::thread::sleep(std::time::Duration::from_millis(15));
 
-                            // 6. Logo / DPI LED Effect Block (EEPROM Addr 0x004C, 2 bytes in off mode: [0x00, 0x55])
+                            // 6. Logo / DPI LED Effect Block (EEPROM Addr 0x004C)
+                            // Off: 2 bytes [0x00, 0x55]; Steady/Respiration: 6 bytes [eff, 0x55-eff, bri, 0x55-bri, clr_idx, 0x55-clr_idx]
                             on_progress(0.85, "Writing Logo/DPI LED Parameters...");
-                            let logo_data = [0x00u8, 0x55u8];
-                            let _ = write_mouse_eeprom(&dev, 0x004C, &logo_data);
+                            match profile.dpi_effect {
+                                DpiEffect::Off => {
+                                    let logo_data = [0x00u8, 0x55u8];
+                                    let _ = write_mouse_eeprom(&dev, 0x004C, &logo_data);
+                                }
+                                DpiEffect::Steady => {
+                                    let eff = 0x01u8;
+                                    let eff_chk = (0x55u8).wrapping_sub(eff);
+                                    let bri = 0xFFu8;
+                                    let bri_chk = (0x55u8).wrapping_sub(bri);
+                                    let clr_idx = (profile.current_stage as u8).clamp(1, 5) - 1;
+                                    let clr_chk = (0x55u8).wrapping_sub(clr_idx);
+                                    let logo_data = [eff, eff_chk, bri, bri_chk, clr_idx, clr_chk];
+                                    let _ = write_mouse_eeprom(&dev, 0x004C, &logo_data);
+                                }
+                                DpiEffect::Respiration => {
+                                    let eff = 0x02u8;
+                                    let eff_chk = (0x55u8).wrapping_sub(eff);
+                                    let bri = 0xFFu8;
+                                    let bri_chk = (0x55u8).wrapping_sub(bri);
+                                    let clr_idx = (profile.current_stage as u8).clamp(1, 5) - 1;
+                                    let clr_chk = (0x55u8).wrapping_sub(clr_idx);
+                                    let logo_data = [eff, eff_chk, bri, bri_chk, clr_idx, clr_chk];
+                                    let _ = write_mouse_eeprom(&dev, 0x004C, &logo_data);
+                                }
+                            }
                             std::thread::sleep(std::time::Duration::from_millis(15));
 
-                            // 7. USB Polling Rate (EEPROM Addr 0x0000, 2 bytes) - Concludes Apply Sequence
+                            // 7. USB Polling Rate (EEPROM Addr 0x0000, 2 bytes) - Concludes EEPROM Apply Sequence
                             on_progress(0.95, "Setting USB Polling Rate...");
                             let rate_chk = (0x55u8).wrapping_sub(rate_hw_byte);
                             let rate_data = [rate_hw_byte, rate_chk];
                             let _ = write_mouse_eeprom(&dev, 0x0000, &rate_data);
                             std::thread::sleep(std::time::Duration::from_millis(15));
+
+                            // 8. Apply Windows Mouse Parameter Tuning (Sensitivity, Precision, Scroll Speed, Double-click)
+                            apply_mouse_parameters(profile);
 
                             on_progress(1.0, "Configuration Applied Successfully!");
                             delivered = true;
@@ -919,7 +1113,7 @@ impl HardwareBridge {
                         }
 
                         // Main LED at +0xA88..+0xA97:
-                        // +0xA88: effect (u32: 1=Steady, 2=Respiration, 3=Neon, 4/0=Streaming/Off)
+                        // +0xA88: effect (u32: 1=Steady, 2=Respiration, 3=Neon, 0=Off)
                         // +0xA8C: speed index (u32: 1..10)
                         // +0xA90: brightness index (u32: 1..10)
                         // +0xA94..+0xA96: RGB (3 bytes)
@@ -929,7 +1123,6 @@ impl HardwareBridge {
                                 LedEffect::Steady => 1,
                                 LedEffect::Respiration => 2,
                                 LedEffect::Neon => 3,
-                                LedEffect::Streaming => 4,
                                 LedEffect::Off => 0,
                             };
                             let spd_val: u32 = profile.led_speed as u32;
@@ -999,7 +1192,6 @@ pub fn export_jmk_bytes(profile: &MouseProfile, profile_index: usize) -> Vec<u8>
         LedEffect::Steady => 1,
         LedEffect::Respiration => 2,
         LedEffect::Neon => 3,
-        LedEffect::Streaming => 4,
         LedEffect::Off => 0,
     };
     data[0x0A88..0x0A88+4].copy_from_slice(&eff_val.to_le_bytes());
@@ -1073,7 +1265,6 @@ pub fn parse_jmk_bytes(bytes: &[u8]) -> Option<MouseProfile> {
             1 => LedEffect::Steady,
             2 => LedEffect::Respiration,
             3 => LedEffect::Neon,
-            4 => LedEffect::Streaming,
             _ => LedEffect::Off,
         };
         profile.led_speed = (spd as u8).clamp(1, 10);
@@ -1090,4 +1281,402 @@ pub fn get_oem_profile_path() -> Option<PathBuf> {
         return Some(p);
     }
     None
+}
+
+#[cfg(windows)]
+pub fn apply_mouse_parameters(profile: &MouseProfile) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW,
+        SPI_SETMOUSESPEED, SPI_SETMOUSE, SPI_SETWHEELSCROLLLINES,
+        SPIF_UPDATEINIFILE, SPIF_SENDCHANGE,
+    };
+
+    extern "system" {
+        fn SetDoubleClickTime(u_interval: u32) -> windows::Win32::Foundation::BOOL;
+    }
+
+    unsafe {
+        // 1. Mouse sensitivity (1..20)
+        let speed = profile.mouse_sensitivity.clamp(1, 20);
+        let _ = SystemParametersInfoW(
+            SPI_SETMOUSESPEED,
+            0,
+            Some(speed as usize as *mut _),
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        );
+
+        // 2. Enhance pointer precision ([6, 10, 1] if true, [0, 0, 0] if false)
+        let mut mouse_params: [i32; 3] = if profile.enhance_pointer_precision {
+            [6, 10, 1]
+        } else {
+            [0, 0, 0]
+        };
+        let _ = SystemParametersInfoW(
+            SPI_SETMOUSE,
+            0,
+            Some(mouse_params.as_mut_ptr() as *mut _),
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        );
+
+        // 3. Wheel scroll lines (u32::MAX for page scroll, else 1..10)
+        let scroll_lines: u32 = if profile.scroll_one_page {
+            u32::MAX
+        } else {
+            profile.scroll_speed.clamp(1, 10)
+        };
+        let _ = SystemParametersInfoW(
+            SPI_SETWHEELSCROLLLINES,
+            scroll_lines,
+            None,
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        );
+
+        // 4. Double click time (slider 1..10 -> 900ms slow to ~200ms fast)
+        let dbl_click_ms = 900u32.saturating_sub((profile.double_click_speed.clamp(1, 10) - 1) * 78);
+        let _ = SetDoubleClickTime(dbl_click_ms);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn apply_mouse_parameters(_profile: &MouseProfile) {}
+
+pub fn reverse_lut(lut: &[u8], val: u8) -> u8 {
+    let mut best_idx = 0;
+    let mut min_diff = u8::MAX;
+    for (i, &lut_val) in lut.iter().enumerate() {
+        let diff = if val > lut_val { val - lut_val } else { lut_val - val };
+        if diff < min_diff {
+            min_diff = diff;
+            best_idx = i;
+        }
+    }
+    (best_idx as u8) + 1
+}
+
+pub fn multimedia_to_consumer_code(action: &str) -> Option<u16> {
+    match action {
+        "Media Player" => Some(0x0183),
+        "Play/Pause" => Some(0x00CD),
+        "Next" => Some(0x00B5),
+        "Previous" => Some(0x00B6),
+        "Stop playing" => Some(0x00B7),
+        "Mute" => Some(0x00E2),
+        "Volume up" => Some(0x00E9),
+        "Volume down" => Some(0x00EA),
+        "Email" => Some(0x018A),
+        "Calculator" => Some(0x0192),
+        "My Computer" => Some(0x0194),
+        "Home page" => Some(0x0223),
+        "Search" => Some(0x0221),
+        "WWW Forward" => Some(0x0225),
+        "WWW Back" => Some(0x0224),
+        "WWW Stop" => Some(0x0226),
+        "WWW Refresh" => Some(0x0227),
+        "Favorites" => Some(0x022A),
+        _ => None,
+    }
+}
+
+pub fn decode_consumer_code(code: u16) -> String {
+    match code {
+        0x0183 => "Media Player".to_string(),
+        0x00CD => "Play/Pause".to_string(),
+        0x00B5 => "Next".to_string(),
+        0x00B6 => "Previous".to_string(),
+        0x00B7 => "Stop playing".to_string(),
+        0x00E2 => "Mute".to_string(),
+        0x00E9 => "Volume up".to_string(),
+        0x00EA => "Volume down".to_string(),
+        0x018A => "Email".to_string(),
+        0x0192 => "Calculator".to_string(),
+        0x0194 => "My Computer".to_string(),
+        0x0223 => "Home page".to_string(),
+        0x0221 => "Search".to_string(),
+        0x0225 => "WWW Forward".to_string(),
+        0x0224 => "WWW Back".to_string(),
+        0x0226 => "WWW Stop".to_string(),
+        0x0227 => "WWW Refresh".to_string(),
+        0x022A => "Favorites".to_string(),
+        _ => format!("Consumer (0x{:04X})", code),
+    }
+}
+
+pub fn parse_key_combo(s: &str) -> (u8, u8) {
+    let mut mod_mask = 0u8;
+    if s.contains("Shift") { mod_mask |= 0x01; }
+    if s.contains("Ctrl") { mod_mask |= 0x02; }
+    if s.contains("Alt") { mod_mask |= 0x04; }
+    if s.contains("Win") { mod_mask |= 0x08; }
+
+    let key_part = s.split('+').last().unwrap_or("").trim();
+    let hid_code = match key_part.to_ascii_uppercase().as_str() {
+        "A" => 0x04, "B" => 0x05, "C" => 0x06, "D" => 0x07, "E" => 0x08,
+        "F" => 0x09, "G" => 0x0A, "H" => 0x0B, "I" => 0x0C, "J" => 0x0D,
+        "K" => 0x0E, "L" => 0x0F, "M" => 0x10, "N" => 0x11, "O" => 0x12,
+        "P" => 0x13, "Q" => 0x14, "R" => 0x15, "S" => 0x16, "T" => 0x17,
+        "U" => 0x18, "V" => 0x19, "W" => 0x1A, "X" => 0x1B, "Y" => 0x1C,
+        "Z" => 0x1D,
+        "1" => 0x1E, "2" => 0x1F, "3" => 0x20, "4" => 0x21, "5" => 0x22,
+        "6" => 0x23, "7" => 0x24, "8" => 0x25, "9" => 0x26, "0" => 0x27,
+        "ENTER" | "RETURN" => 0x28,
+        "ESCAPE" | "ESC" => 0x29,
+        "BACKSPACE" => 0x2A,
+        "TAB" => 0x2B,
+        "SPACE" => 0x2C,
+        "F1" => 0x3A, "F2" => 0x3B, "F3" => 0x3C, "F4" => 0x3D,
+        "F5" => 0x3E, "F6" => 0x3F, "F7" => 0x40, "F8" => 0x41,
+        "F9" => 0x42, "F10" => 0x43, "F11" => 0x44, "F12" => 0x45,
+        _ => 0x00,
+    };
+    (mod_mask, hid_code)
+}
+
+pub fn decode_combo_data(data: &[u8]) -> String {
+    let mut mods = Vec::new();
+    let mut key_str = String::new();
+    let mut i = 1;
+    while i + 2 < data.len() {
+        match data[i] {
+            0x80 => {
+                let mask = data[i + 1];
+                if mask & 0x02 != 0 { mods.push("Ctrl"); }
+                if mask & 0x01 != 0 { mods.push("Shift"); }
+                if mask & 0x04 != 0 { mods.push("Alt"); }
+                if mask & 0x08 != 0 { mods.push("Win"); }
+                i += 3;
+            }
+            0x81 => {
+                let hid = data[i + 1];
+                key_str = match hid {
+                    0x04..=0x1D => format!("{}", (b'A' + (hid - 0x04)) as char),
+                    0x1E..=0x26 => format!("{}", (b'1' + (hid - 0x1E)) as char),
+                    0x27 => "0".to_string(),
+                    0x28 => "Enter".to_string(),
+                    0x29 => "Esc".to_string(),
+                    0x2A => "Backspace".to_string(),
+                    0x2B => "Tab".to_string(),
+                    0x2C => "Space".to_string(),
+                    0x3A..=0x45 => format!("F{}", hid - 0x39),
+                    _ => format!("Key0x{:02X}", hid),
+                };
+                i += 3;
+            }
+            _ => break,
+        }
+    }
+    if !key_str.is_empty() {
+        mods.push(&key_str);
+    }
+    if mods.is_empty() {
+        "Key combination".to_string()
+    } else {
+        format!("Combo: {}", mods.join("+"))
+    }
+}
+
+pub fn decode_button_action(b0: u8, b1: u8, b2: u8) -> String {
+    match (b0, b1, b2) {
+        (0x01, 0x01, 0x00) => "Left button".to_string(),
+        (0x01, 0x02, 0x00) => "Right button".to_string(),
+        (0x01, 0x04, 0x00) => "Middle button".to_string(),
+        (0x01, 0x10, 0x00) => "Forward".to_string(),
+        (0x01, 0x08, 0x00) => "Back".to_string(),
+        (0x09, 0x00, 0x00) => "Three click".to_string(),
+        (0x07, 0x00, 0x00) => "Fire key".to_string(),
+        (0x02, 0x02, 0x00) => "DPI +".to_string(),
+        (0x02, 0x03, 0x00) => "DPI -".to_string(),
+        (0x02, 0x01, 0x00) => "DPI Loop".to_string(),
+        (0x04, 0x32, 0x05) => "RGB ON/OFF".to_string(),
+        (0x08, 0x00, 0x00) => "Polling rate switch".to_string(),
+        (0x00, 0x00, 0x00) => "Disable".to_string(),
+        (0x06, id, _) => format!("Macro - Slot {}", id),
+        (0x05, _, _) => "Multimedia / Key combination".to_string(),
+        _ => "Left button".to_string(),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MouseHardwareConfig {
+    pub polling_rate: PollingRate,
+    pub active_stage_count: usize,
+    pub active_stage_idx: usize,
+    pub dpi_stages: Vec<DpiStage>,
+    pub main_led_effect: LedEffect,
+    pub main_led_color: [u8; 3],
+    pub main_led_speed: u8,
+    pub main_led_brightness: u8,
+    pub dpi_led_effect: DpiEffect,
+    pub button_actions: [String; 8],
+    pub battery_percent: u8,
+    pub is_charging: bool,
+}
+
+pub fn read_device_config(vid: u16) -> Result<MouseHardwareConfig, String> {
+    if IS_APPLYING.load(Ordering::SeqCst) {
+        return Err("Cannot read device config while applying settings".to_string());
+    }
+
+    let api = hidapi::HidApi::new().map_err(|e| e.to_string())?;
+    let mut cmd_dev = None;
+    let mut is_wired = false;
+    for dev_info in api.device_list() {
+        if dev_info.vendor_id() == vid && dev_info.product_id() == DEFAULT_PID_WIRED && dev_info.usage_page() == 0xFF02 {
+            if let Ok(dev) = dev_info.open_device(&api) {
+                cmd_dev = Some(dev);
+                is_wired = true;
+                break;
+            }
+        }
+    }
+    if cmd_dev.is_none() {
+        for dev_info in api.device_list() {
+            if dev_info.vendor_id() == vid && dev_info.product_id() == DEFAULT_PID_WIRELESS && dev_info.usage_page() == 0xFF02 {
+                if let Ok(dev) = dev_info.open_device(&api) {
+                    cmd_dev = Some(dev);
+                    break;
+                }
+            }
+        }
+    }
+
+    let dev = cmd_dev.ok_or_else(|| "No command device (0xFF02) found".to_string())?;
+
+    // 1. Polling rate (0x0000, 2 bytes)
+    let rate_data = read_mouse_eeprom(&dev, None, 0x0000, 2)?;
+    let polling_rate = match rate_data.get(0).copied().unwrap_or(0x01) {
+        0x08 => PollingRate::Hz125,
+        0x04 => PollingRate::Hz250,
+        0x02 => PollingRate::Hz500,
+        _ => PollingRate::Hz1000,
+    };
+
+    // 2. Active DPI stage count (0x0002, 2 bytes)
+    let count_data = read_mouse_eeprom(&dev, None, 0x0002, 2)?;
+    let active_stage_count = count_data.get(0).copied().unwrap_or(5).clamp(1, 5) as usize;
+
+    // 3. Active DPI stage index (0x0004, 2 bytes)
+    let idx_data = read_mouse_eeprom(&dev, None, 0x0004, 2)?;
+    let active_stage_idx = ((idx_data.get(0).copied().unwrap_or(0) & 0x0F) as usize).clamp(0, 4) + 1;
+
+    // 4. Sensor DPI stages (0x000C, 20 bytes total in chunks: 8, 8, 4)
+    let d1 = read_mouse_eeprom(&dev, None, 0x000C, 8)?;
+    let d2 = read_mouse_eeprom(&dev, None, 0x0014, 8)?;
+    let d3 = read_mouse_eeprom(&dev, None, 0x001C, 4)?;
+    let mut stages_raw = Vec::new();
+    stages_raw.extend_from_slice(&d1);
+    stages_raw.extend_from_slice(&d2);
+    stages_raw.extend_from_slice(&d3);
+
+    // 5. DPI Colors (0x002C, 20 bytes total in chunks: 8, 8, 4)
+    let c1 = read_mouse_eeprom(&dev, None, 0x002C, 8)?;
+    let c2 = read_mouse_eeprom(&dev, None, 0x0034, 8)?;
+    let c3 = read_mouse_eeprom(&dev, None, 0x003C, 4)?;
+    let mut colors_raw = Vec::new();
+    colors_raw.extend_from_slice(&c1);
+    colors_raw.extend_from_slice(&c2);
+    colors_raw.extend_from_slice(&c3);
+
+    let mut dpi_stages = Vec::new();
+    for i in 0..5 {
+        let x_code = stages_raw.get(i * 4).copied().unwrap_or(0x1B);
+        let hi = stages_raw.get(i * 4 + 2).copied().unwrap_or(0) != 0;
+        let dpi_val = paw3325_code_to_dpi(x_code, hi);
+
+        let r = colors_raw.get(i * 4).copied().unwrap_or(255);
+        let g = colors_raw.get(i * 4 + 1).copied().unwrap_or(0);
+        let b = colors_raw.get(i * 4 + 2).copied().unwrap_or(0);
+
+        dpi_stages.push(DpiStage {
+            enabled: i < active_stage_count,
+            x: dpi_val,
+            y: dpi_val,
+            color_rgb: [r, g, b],
+        });
+    }
+
+    // 6. DPI LED Effect (0x004C, 6 bytes)
+    let d_eff = read_mouse_eeprom(&dev, None, 0x004C, 6).unwrap_or_else(|_| vec![0x00, 0x55]);
+    let dpi_led_effect = match d_eff.get(0).copied().unwrap_or(0) {
+        0x01 => DpiEffect::Steady,
+        0x02 => DpiEffect::Respiration,
+        _ => DpiEffect::Off,
+    };
+
+    // 7. Button matrix (0x0060..0x008F)
+    const SPEED_LUT: [u8; 10] = [0xFF, 0xE6, 0xD2, 0xBE, 0xAA, 0x96, 0x82, 0x6E, 0x46, 0x28];
+    const NEON_SPEED_LUT: [u8; 10] = [0x2D, 0x28, 0x23, 0x1E, 0x19, 0x13, 0x0F, 0x0A, 0x05, 0x03];
+    const BRIGHTNESS_LUT: [u8; 10] = [0x19, 0x32, 0x4B, 0x64, 0x7D, 0x96, 0xAF, 0xC8, 0xE1, 0xFF];
+
+    let b_chunk0 = read_mouse_eeprom(&dev, None, 0x0060, 8).unwrap_or_else(|_| vec![1, 1, 0, 0x53, 1, 2, 0, 0x52]);
+    let b_chunk1 = read_mouse_eeprom(&dev, None, 0x0068, 8).unwrap_or_else(|_| vec![1, 4, 0, 0x50, 1, 8, 0, 0x4C]);
+    let b_chunk2 = read_mouse_eeprom(&dev, None, 0x0070, 8).unwrap_or_else(|_| vec![1, 0x10, 0, 0x44, 0, 0, 0, 0x55]);
+    let b_chunk3 = read_mouse_eeprom(&dev, None, 0x0078, 8).unwrap_or_else(|_| vec![9, 0, 0, 0x4C, 0, 0, 0, 0x55]);
+    let b_chunk4 = read_mouse_eeprom(&dev, None, 0x0088, 8).unwrap_or_else(|_| vec![2, 2, 0, 0x51, 2, 3, 0, 0x50]);
+
+    let decode_slot = |b0: u8, b1: u8, b2: u8, slot: usize| -> String {
+        if b0 == 0x05 {
+            let combo_addr = 0x0100 + (slot as u16) * 0x20;
+            if let Ok(combo) = read_mouse_eeprom(&dev, None, combo_addr, 10) {
+                if combo.get(1) == Some(&0x82) && combo.len() >= 4 {
+                    let code = (combo[2] as u16) | ((combo[3] as u16) << 8);
+                    return decode_consumer_code(code);
+                } else if combo.get(1) == Some(&0x80) || combo.get(1) == Some(&0x81) {
+                    return decode_combo_data(&combo);
+                }
+            }
+        }
+        decode_button_action(b0, b1, b2)
+    };
+
+    let btn1 = decode_slot(b_chunk0[0], b_chunk0[1], b_chunk0[2], BUTTON_SLOT_MAP[0]);
+    let btn2 = decode_slot(b_chunk0[4], b_chunk0[5], b_chunk0[6], BUTTON_SLOT_MAP[1]);
+    let btn3 = decode_slot(b_chunk1[0], b_chunk1[1], b_chunk1[2], BUTTON_SLOT_MAP[2]);
+    let btn5 = decode_slot(b_chunk1[4], b_chunk1[5], b_chunk1[6], BUTTON_SLOT_MAP[4]);
+    let btn4 = decode_slot(b_chunk2[0], b_chunk2[1], b_chunk2[2], BUTTON_SLOT_MAP[3]);
+    let btn6 = decode_slot(b_chunk3[0], b_chunk3[1], b_chunk3[2], BUTTON_SLOT_MAP[5]);
+    let btn7 = decode_slot(b_chunk4[0], b_chunk4[1], b_chunk4[2], BUTTON_SLOT_MAP[6]);
+    let btn8 = decode_slot(b_chunk4[4], b_chunk4[5], b_chunk4[6], BUTTON_SLOT_MAP[7]);
+
+    let button_actions = [btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8];
+
+    // 8. Main RGB LED (0x00A0, 7 bytes)
+    let rgb_data = read_mouse_eeprom(&dev, None, 0x00A0, 7).unwrap_or_else(|_| vec![0x02, 255, 0, 0, 0x96, 0x7D, 0x00]);
+    let main_led_effect = match rgb_data.get(0).copied().unwrap_or(0x02) {
+        0x00 => LedEffect::Neon,
+        0x01 => LedEffect::Respiration,
+        0x02 => LedEffect::Steady,
+        _ => LedEffect::Off,
+    };
+    let main_led_color = [
+        rgb_data.get(1).copied().unwrap_or(255),
+        rgb_data.get(2).copied().unwrap_or(0),
+        rgb_data.get(3).copied().unwrap_or(0),
+    ];
+    let spd_byte = rgb_data.get(4).copied().unwrap_or(0x96);
+    let bri_byte = rgb_data.get(5).copied().unwrap_or(0x7D);
+    let main_led_speed = if main_led_effect == LedEffect::Neon {
+        reverse_lut(&NEON_SPEED_LUT, spd_byte)
+    } else {
+        reverse_lut(&SPEED_LUT, spd_byte)
+    };
+    let main_led_brightness = reverse_lut(&BRIGHTNESS_LUT, bri_byte);
+
+    // 9. Battery
+    let (battery_percent, chg) = query_mouse_battery(&dev, None).unwrap_or((100, false));
+    let is_charging = if is_wired { true } else { chg };
+
+    Ok(MouseHardwareConfig {
+        polling_rate,
+        active_stage_count,
+        active_stage_idx,
+        dpi_stages,
+        main_led_effect,
+        main_led_color,
+        main_led_speed,
+        main_led_brightness,
+        dpi_led_effect,
+        button_actions,
+        battery_percent,
+        is_charging,
+    })
 }

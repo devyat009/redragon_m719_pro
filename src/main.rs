@@ -78,6 +78,40 @@ fn trim_memory() {
 #[cfg(not(windows))]
 fn trim_memory() {}
 
+#[cfg(windows)]
+fn hide_main_window() {
+    unsafe {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SW_HIDE};
+        let window_title = w!("Redragon INVADER PRO (M719RGB-PRO) Suite");
+        if let Ok(hwnd) = FindWindowW(None, window_title) {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_main_window() {}
+
+#[cfg(windows)]
+fn show_main_window() {
+    unsafe {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+        };
+        let window_title = w!("Redragon INVADER PRO (M719RGB-PRO) Suite");
+        if let Ok(hwnd) = FindWindowW(None, window_title) {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn show_main_window() {}
+
 fn is_autostart_enabled() -> bool {
     let output = std::process::Command::new("reg")
         .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "RedragonInvaderPro"])
@@ -210,6 +244,27 @@ struct RedragonApp {
     apply_rx: Option<std::sync::mpsc::Receiver<(f32, String)>>,
     apply_progress: Option<(f32, String)>,
     osd: OsdController,
+    // Key Combination modal state (Image 3)
+    show_key_combo_modal: bool,
+    key_combo_btn_idx: usize,
+    key_combo_key: String,
+    key_combo_shift: bool,
+    key_combo_ctrl: bool,
+    key_combo_alt: bool,
+    key_combo_win: bool,
+    // Macro List modal state (Image 4)
+    show_macro_list_modal: bool,
+    macro_modal_btn_idx: usize,
+    selected_macro_modal_name: String,
+    // Custom button action dropdown with flyout submenus
+    action_menu_open: bool,
+    active_submenu: Option<ActionSubmenu>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionSubmenu {
+    Dpi,
+    Multimedia,
 }
 
 impl RedragonApp {
@@ -240,6 +295,54 @@ impl RedragonApp {
     fn show_dpi_toast(&mut self, stage: usize, dpi: u32, color_rgb: [u8; 3]) {
         self.osd.show_dpi(stage, dpi, color_rgb);
     }
+
+    fn ingest_device_config(&mut self) {
+        if !self.bridge.connected {
+            return;
+        }
+        match hardware::read_device_config(self.bridge.vid) {
+            Ok(cfg) => {
+                self.bridge.battery_percent = cfg.battery_percent;
+                if !self.bridge.is_wireless || self.bridge.found_wired {
+                    self.bridge.is_charging = true;
+                } else {
+                    self.bridge.is_charging = cfg.is_charging;
+                }
+                let active = &mut self.profiles[self.active_profile_idx];
+                active.polling_rate = cfg.polling_rate;
+                active.current_stage = cfg.active_stage_idx;
+                active.dpi_stages = cfg.dpi_stages.clone();
+                active.dpi_effect = cfg.dpi_led_effect;
+                active.led_effect = cfg.main_led_effect;
+                active.led_color = cfg.main_led_color;
+                active.led_speed = cfg.main_led_speed;
+                active.led_brightness = cfg.main_led_brightness;
+                active.button_actions = cfg.button_actions.clone();
+                self.sync_dpi_stages_cache();
+
+                let stage_summary: Vec<String> = cfg
+                    .dpi_stages
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| format!("S{}: {} DPI{}", i + 1, s.x, if s.enabled { "" } else { " (off)" }))
+                    .collect();
+
+                self.add_log(LogLevel::Status, "Mouse hardware EEPROM configuration ingested successfully:");
+                self.add_log(LogLevel::Info, format!("  • Polling Rate: {:?} | Active Stages: {}/5 (Current: Stage {}) | Power: {}% ({})",
+                    cfg.polling_rate, cfg.active_stage_count, cfg.active_stage_idx, cfg.battery_percent, if cfg.is_charging { "Charging ⚡" } else { "Battery" }));
+                self.add_log(LogLevel::Info, format!("  • DPI Stages: [{}]", stage_summary.join(", ")));
+                self.add_log(LogLevel::Info, format!("  • Main RGB: {:?}, Color #{:02X}{:02X}{:02X}, Speed {}/10, Bri {}/10 | Logo/DPI LED: {:?}",
+                    cfg.main_led_effect, cfg.main_led_color[0], cfg.main_led_color[1], cfg.main_led_color[2],
+                    cfg.main_led_speed, cfg.main_led_brightness, cfg.dpi_led_effect));
+                self.add_log(LogLevel::Info, format!("  • Buttons: [1:{}, 2:{}, 3:{}, 4:{}, 5:{}, 6:{}, 7:{}, 8:{}]",
+                    cfg.button_actions[0], cfg.button_actions[1], cfg.button_actions[2], cfg.button_actions[3],
+                    cfg.button_actions[4], cfg.button_actions[5], cfg.button_actions[6], cfg.button_actions[7]));
+            }
+            Err(e) => {
+                self.add_log(LogLevel::Warn, format!("Could not ingest hardware EEPROM configuration: {}", e));
+            }
+        }
+    }
 }
 
 impl Default for RedragonApp {
@@ -253,7 +356,7 @@ impl Default for RedragonApp {
 
         let macros = vec![
             MacroItem {
-                name: "40ms Rapid".to_string(),
+                name: "40ms".to_string(),
                 key_events: vec![
                     "Key Down: L-Button".to_string(),
                     "Delay: 40ms".to_string(),
@@ -261,7 +364,7 @@ impl Default for RedragonApp {
                 ],
             },
             MacroItem {
-                name: "Fast Double".to_string(),
+                name: "fast".to_string(),
                 key_events: vec![
                     "Key Down: R-Button".to_string(),
                     "Delay: 20ms".to_string(),
@@ -269,7 +372,7 @@ impl Default for RedragonApp {
                 ],
             },
             MacroItem {
-                name: "Jumpshot".to_string(),
+                name: "JUMPSHOT".to_string(),
                 key_events: vec![
                     "Key Down: Space".to_string(),
                     "Delay: 35ms".to_string(),
@@ -331,6 +434,18 @@ impl Default for RedragonApp {
             apply_rx: None,
             apply_progress: None,
             osd,
+            show_key_combo_modal: false,
+            key_combo_btn_idx: 0,
+            key_combo_key: String::new(),
+            key_combo_shift: false,
+            key_combo_ctrl: false,
+            key_combo_alt: false,
+            key_combo_win: false,
+            show_macro_list_modal: false,
+            macro_modal_btn_idx: 0,
+            selected_macro_modal_name: "40ms".to_string(),
+            action_menu_open: false,
+            active_submenu: None,
         };
 
         trim_memory();
@@ -345,6 +460,7 @@ impl Default for RedragonApp {
                 "Wired USB"
             };
             app.add_log(LogLevel::Status, format!("Device detected: {} [{}] (Battery: {}%)", app.bridge.device_name, mode, app.bridge.battery_percent));
+            app.ingest_device_config();
         } else if app.bridge.found_dongle {
             app.add_log(LogLevel::Warn, format!("2.4G USB Receiver connected (PID 0x{:04X}), but mouse is not responding: verify mouse switch is ON underneath or wake up mouse from sleep.", app.bridge.pid));
         } else {
@@ -402,6 +518,7 @@ impl eframe::App for RedragonApp {
         if let Ok(event) = TrayIconEvent::receiver().try_recv() {
             match event {
                 TrayIconEvent::Click { button: tray_icon::MouseButton::Left, .. } | TrayIconEvent::DoubleClick { .. } => {
+                    show_main_window();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -413,10 +530,12 @@ impl eframe::App for RedragonApp {
         while let Ok(action) = self.tray_rx.try_recv() {
             match action {
                 TrayAction::Show => {
+                    show_main_window();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 TrayAction::Hide => {
+                    hide_main_window();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     trim_memory();
                 }
@@ -467,6 +586,7 @@ impl eframe::App for RedragonApp {
         // Intercept window close button if minimize to tray is enabled
         if self.minimize_to_tray && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            hide_main_window();
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             trim_memory();
             self.add_log(LogLevel::Info, "Application minimized to system tray notification area.");
@@ -492,6 +612,7 @@ impl eframe::App for RedragonApp {
                     } else {
                         self.add_log(LogLevel::Status, format!("Mouse connected via Wired USB (Battery: {}%)", self.bridge.battery_percent));
                     }
+                    self.ingest_device_config();
                 } else if self.bridge.found_dongle {
                     self.add_log(LogLevel::Warn, "Mouse link lost: 2.4G receiver is plugged in, but mouse switch was turned OFF or entered standby sleep.");
                 } else {
@@ -504,7 +625,11 @@ impl eframe::App for RedragonApp {
 
             self.last_poll_time = Instant::now();
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(800));
+        if self.bridge.is_charging {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(800));
+        }
 
         // Embed & Load genuine mouse image texture
         if self.mouse_texture.is_none() {
@@ -817,7 +942,7 @@ impl eframe::App for RedragonApp {
 
                                 // Interactive clickable rect for the button on the mouse
                                 let pin_rect = egui::Rect::from_center_size(pin_center, egui::vec2(26.0, 26.0));
-                                let pin_resp = ui.allocate_rect(pin_rect, egui::Sense::click());
+                                let pin_resp = ui.interact(pin_rect, ui.id().with(("mouse_pin", b)), egui::Sense::click());
                                 if pin_resp.clicked() {
                                     active_profile.selected_button = b;
                                 }
@@ -904,26 +1029,271 @@ impl eframe::App for RedragonApp {
                         let b_idx = active_profile.selected_button.saturating_sub(1);
                         ui.horizontal(|ui| {
                             ui.label(format!("Button {} Action:", active_profile.selected_button));
-                            let available_actions = [
-                                "Left button",
-                                "Right button",
-                                "Middle button",
-                                "Forward",
-                                "Back",
-                                "Fire key",
-                                "RGB ON/OFF",
-                                "DPI +",
-                                "DPI -",
-                            ];
-                            egui::ComboBox::from_id_salt("key_action_select")
-                                .selected_text(&active_profile.button_actions[b_idx])
-                                .show_ui(ui, |ui| {
-                                    for action in available_actions.iter() {
-                                        if ui.selectable_value(&mut active_profile.button_actions[b_idx], action.to_string(), *action).clicked() {
-                                            // Action changed
-                                        }
+                            let current_action = active_profile.button_actions[b_idx].clone();
+
+                            let (btn_rect, btn_resp) = ui.allocate_exact_size(egui::vec2(210.0, 24.0), egui::Sense::click());
+                            let border_color = egui::Color32::from_rgb(85, 88, 102);
+                            let bg_color = egui::Color32::from_rgb(30, 32, 38);
+
+                            ui.painter().rect_filled(btn_rect, 2.0, bg_color);
+                            ui.painter().rect_stroke(btn_rect, 2.0, egui::Stroke::new(1.0_f32, border_color));
+
+                            let arrow_box_w = 24.0;
+                            let arrow_box_rect = egui::Rect::from_min_max(
+                                egui::pos2(btn_rect.max.x - arrow_box_w, btn_rect.min.y),
+                                btn_rect.max,
+                            );
+                            ui.painter().rect_filled(arrow_box_rect, egui::Rounding::ZERO, egui::Color32::from_rgb(45, 48, 56));
+                            ui.painter().line_segment(
+                                [arrow_box_rect.left_top(), arrow_box_rect.left_bottom()],
+                                egui::Stroke::new(1.0_f32, border_color),
+                            );
+                            ui.painter().text(
+                                arrow_box_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "▾",
+                                egui::FontId::proportional(13.0),
+                                egui::Color32::WHITE,
+                            );
+
+                            let display_text = if current_action.len() > 22 {
+                                format!("{}…", &current_action[..20])
+                            } else {
+                                current_action.clone()
+                            };
+                            ui.painter().text(
+                                egui::pos2(btn_rect.min.x + 8.0, btn_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                display_text,
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::WHITE,
+                            );
+
+                            if btn_resp.clicked() {
+                                self.action_menu_open = !self.action_menu_open;
+                                self.active_submenu = None;
+                            }
+
+                            let row_h = 24.0;
+                            let menu_min = egui::pos2(btn_rect.min.x, btn_rect.max.y + 2.0);
+                            let menu_rect = egui::Rect::from_min_size(menu_min, egui::vec2(210.0, 14.0 * row_h));
+                            let dpi_sub_pos = egui::pos2(menu_rect.max.x + 1.0, menu_min.y + 12.0 * row_h);
+                            let dpi_sub_rect = egui::Rect::from_min_size(dpi_sub_pos, egui::vec2(140.0, 3.0 * row_h));
+                            let mm_sub_h = 18.0 * row_h;
+                            let mm_sub_y = (menu_rect.max.y - mm_sub_h).max(20.0);
+                            let mm_sub_pos = egui::pos2(menu_rect.max.x + 1.0, mm_sub_y);
+                            let mm_sub_rect = egui::Rect::from_min_size(mm_sub_pos, egui::vec2(165.0, mm_sub_h));
+
+                            // Outside click dismissal
+                            if self.action_menu_open && ctx.input(|i| i.pointer.any_click()) {
+                                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                                    let in_btn = btn_rect.contains(pos);
+                                    let in_main = menu_rect.contains(pos);
+                                    let in_sub = match self.active_submenu {
+                                        Some(ActionSubmenu::Dpi) => dpi_sub_rect.contains(pos),
+                                        Some(ActionSubmenu::Multimedia) => mm_sub_rect.contains(pos),
+                                        None => false,
+                                    };
+                                    if !in_btn && !in_main && !in_sub {
+                                        self.action_menu_open = false;
+                                        self.active_submenu = None;
                                     }
-                                });
+                                }
+                            }
+
+                            if self.action_menu_open {
+                                egui::Area::new(egui::Id::new("action_main_dropdown_area"))
+                                    .order(egui::Order::Foreground)
+                                    .fixed_pos(menu_min)
+                                    .show(ctx, |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                        ui.spacing_mut().window_margin = egui::Margin::ZERO;
+                                        ui.set_width(210.0);
+                                        ui.painter().rect_filled(menu_rect, 0.0, egui::Color32::from_rgb(38, 40, 48));
+                                        ui.painter().rect_stroke(menu_rect, 0.0, egui::Stroke::new(1.0_f32, border_color));
+
+                                        let main_items = [
+                                            "Left button",
+                                            "Right button",
+                                            "Middle button",
+                                            "Forward",
+                                            "Back",
+                                            "Three click",
+                                            "RGB ON/OFF",
+                                            "Polling rate switch",
+                                            "Fire key",
+                                            "Key combination",
+                                            "Disable",
+                                            "Macro",
+                                            "DPI",
+                                            "Multimedia",
+                                        ];
+
+                                        for (i, &name) in main_items.iter().enumerate() {
+                                            let (r, resp) = ui.allocate_exact_size(egui::vec2(210.0, row_h), egui::Sense::click());
+                                            let is_active = if i == 12 {
+                                                resp.hovered() || self.active_submenu == Some(ActionSubmenu::Dpi)
+                                            } else if i == 13 {
+                                                resp.hovered() || self.active_submenu == Some(ActionSubmenu::Multimedia)
+                                            } else {
+                                                resp.hovered()
+                                            };
+
+                                            let fill = if is_active {
+                                                self.accent_color
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            };
+                                            ui.painter().rect_filled(r, 0.0, fill);
+
+                                            if i == 12 || i == 13 {
+                                                ui.painter().text(
+                                                    egui::pos2(r.min.x + 12.0, r.center().y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    name,
+                                                    egui::FontId::proportional(12.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                                ui.painter().text(
+                                                    egui::pos2(r.max.x - 12.0, r.center().y),
+                                                    egui::Align2::RIGHT_CENTER,
+                                                    "▶▶",
+                                                    egui::FontId::proportional(10.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            } else {
+                                                ui.painter().text(
+                                                    egui::pos2(r.min.x + 12.0, r.center().y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    name,
+                                                    egui::FontId::proportional(12.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            }
+
+                                            if resp.hovered() {
+                                                if i == 12 {
+                                                    self.active_submenu = Some(ActionSubmenu::Dpi);
+                                                } else if i == 13 {
+                                                    self.active_submenu = Some(ActionSubmenu::Multimedia);
+                                                } else {
+                                                    self.active_submenu = None;
+                                                }
+                                            }
+
+                                            if resp.clicked() {
+                                                if i == 12 {
+                                                    self.active_submenu = Some(ActionSubmenu::Dpi);
+                                                } else if i == 13 {
+                                                    self.active_submenu = Some(ActionSubmenu::Multimedia);
+                                                } else if i == 9 {
+                                                    self.show_key_combo_modal = true;
+                                                    self.key_combo_btn_idx = b_idx;
+                                                    self.key_combo_key.clear();
+                                                    self.key_combo_shift = false;
+                                                    self.key_combo_ctrl = false;
+                                                    self.key_combo_alt = false;
+                                                    self.key_combo_win = false;
+                                                    self.action_menu_open = false;
+                                                    self.active_submenu = None;
+                                                } else if i == 11 {
+                                                    self.show_macro_list_modal = true;
+                                                    self.macro_modal_btn_idx = b_idx;
+                                                    if let Some(m) = self.macros.first() {
+                                                        self.selected_macro_modal_name = m.name.clone();
+                                                    }
+                                                    self.action_menu_open = false;
+                                                    self.active_submenu = None;
+                                                } else {
+                                                    active_profile.button_actions[b_idx] = name.to_string();
+                                                    self.action_menu_open = false;
+                                                    self.active_submenu = None;
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                if self.active_submenu == Some(ActionSubmenu::Dpi) {
+                                    egui::Area::new(egui::Id::new("action_dpi_flyout_area"))
+                                        .order(egui::Order::Foreground)
+                                        .fixed_pos(dpi_sub_pos)
+                                        .show(ctx, |ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                            ui.spacing_mut().window_margin = egui::Margin::ZERO;
+                                            ui.set_width(140.0);
+                                            ui.painter().rect_filled(dpi_sub_rect, 0.0, egui::Color32::from_rgb(38, 40, 48));
+                                            ui.painter().rect_stroke(dpi_sub_rect, 0.0, egui::Stroke::new(1.0_f32, border_color));
+
+                                            for dpi_act in &["DPI +", "DPI -", "DPI Loop"] {
+                                                let (r, resp) = ui.allocate_exact_size(egui::vec2(140.0, row_h), egui::Sense::click());
+                                                let fill = if resp.hovered() { self.accent_color } else { egui::Color32::TRANSPARENT };
+                                                ui.painter().rect_filled(r, 0.0, fill);
+                                                ui.painter().text(
+                                                    egui::pos2(r.min.x + 14.0, r.center().y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    *dpi_act,
+                                                    egui::FontId::proportional(12.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                                if resp.clicked() {
+                                                    active_profile.button_actions[b_idx] = dpi_act.to_string();
+                                                    self.action_menu_open = false;
+                                                    self.active_submenu = None;
+                                                }
+                                            }
+                                        });
+                                } else if self.active_submenu == Some(ActionSubmenu::Multimedia) {
+                                    egui::Area::new(egui::Id::new("action_mm_flyout_area"))
+                                        .order(egui::Order::Foreground)
+                                        .fixed_pos(mm_sub_pos)
+                                        .show(ctx, |ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                            ui.spacing_mut().window_margin = egui::Margin::ZERO;
+                                            ui.set_width(165.0);
+                                            ui.painter().rect_filled(mm_sub_rect, 0.0, egui::Color32::from_rgb(38, 40, 48));
+                                            ui.painter().rect_stroke(mm_sub_rect, 0.0, egui::Stroke::new(1.0_f32, border_color));
+
+                                            let mm_items = [
+                                                "Media Player",
+                                                "Play/Pause",
+                                                "Next",
+                                                "Previous",
+                                                "Stop playing",
+                                                "Mute",
+                                                "Volume up",
+                                                "Volume down",
+                                                "Email",
+                                                "Calculator",
+                                                "My Computer",
+                                                "Home page",
+                                                "Search",
+                                                "WWW Forward",
+                                                "WWW Back",
+                                                "WWW Stop",
+                                                "WWW Refresh",
+                                                "Favorites",
+                                            ];
+
+                                            for mm_act in &mm_items {
+                                                let (r, resp) = ui.allocate_exact_size(egui::vec2(165.0, row_h), egui::Sense::click());
+                                                let fill = if resp.hovered() { self.accent_color } else { egui::Color32::TRANSPARENT };
+                                                ui.painter().rect_filled(r, 0.0, fill);
+                                                ui.painter().text(
+                                                    egui::pos2(r.min.x + 14.0, r.center().y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    *mm_act,
+                                                    egui::FontId::proportional(12.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                                if resp.clicked() {
+                                                    active_profile.button_actions[b_idx] = mm_act.to_string();
+                                                    self.action_menu_open = false;
+                                                    self.active_submenu = None;
+                                                }
+                                            }
+                                        });
+                                }
+                            }
                         });
 
                         ui.add_space(10.0);
@@ -957,37 +1327,62 @@ impl eframe::App for RedragonApp {
                         });
 
                         ui.add_space(8.0);
-                        // Battery Bar with Live Hardware Percentage & Slim Animated Indicator
+                        // Battery Bar with Live Hardware Percentage & Slim Animated Indicator (Matching Image 4)
                         ui.horizontal(|ui| {
-                            let label_prefix = if self.bridge.is_charging { "Battery (Charging ⚡):" } else { "Battery:" };
-                            ui.label(egui::RichText::new(label_prefix).strong());
+                            ui.label(egui::RichText::new("Battery").strong());
 
                             let t = ctx.input(|i| i.time);
                             let bat = self.bridge.battery_percent;
 
-                            let (rect, _response) = ui.allocate_exact_size(egui::vec2(220.0, 8.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(28, 30, 36));
+                            let (rect, bat_resp) = ui.allocate_exact_size(egui::vec2(220.0, 10.0), egui::Sense::click());
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(18, 20, 24));
+                            ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(45, 48, 58)));
 
-                            let dark_green = egui::Color32::from_rgb(27, 94, 32); // Darker green #1B5E20
-                            let gold = egui::Color32::from_rgb(255, 170, 0);
+                            if bat_resp.clicked() {
+                                self.bridge.is_charging = !self.bridge.is_charging;
+                            }
+                            bat_resp.on_hover_text(if self.bridge.is_charging {
+                                "Charging via USB. Click to toggle animation preview."
+                            } else {
+                                "Running on Battery power. Click to test/preview charging animation."
+                            });
+
+                            let neon_green = egui::Color32::from_rgb(0, 230, 118); // Bright green #00E676
 
                             if self.bridge.is_charging {
-                                // Smooth wave shimmer during charging
-                                let cycle = ((t * 0.8).fract() as f32) * rect.width();
-                                let fill_w = (cycle + 40.0).min(rect.width());
+                                ctx.request_repaint();
+                                // Full smooth charging wave animation
+                                let fill_w = (rect.width() * (bat as f32 / 100.0)).clamp(6.0, rect.width());
                                 let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height()));
-                                ui.painter().rect_filled(fill_rect, 4.0, gold);
-                                ui.label(egui::RichText::new(format!("{} % (Charging)", bat))
-                                    .color(gold)
-                                    .size(12.0)
+                                ui.painter().rect_filled(fill_rect, 2.0, neon_green);
+
+                                // Luminous glowing wave shimmer moving continuously through the filled bar
+                                let wave_phase = (t * 1.5).fract() as f32; // 0.0 .. 1.0
+                                let beam_w = 40.0_f32;
+                                let beam_center = rect.min.x + wave_phase * (fill_w + beam_w) - (beam_w / 2.0);
+                                let b_min = beam_center.max(rect.min.x);
+                                let b_max = (beam_center + beam_w).min(rect.min.x + fill_w);
+                                if b_max > b_min {
+                                    let beam_rect = egui::Rect::from_min_max(
+                                        egui::pos2(b_min, rect.min.y),
+                                        egui::pos2(b_max, rect.max.y),
+                                    );
+                                    ui.painter().rect_filled(beam_rect, 2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 175));
+                                }
+
+                                let pulse_alpha = ((t * 4.0).sin() * 0.35 + 0.65).clamp(0.3, 1.0);
+                                let pulse_color = egui::Color32::from_rgba_unmultiplied(0, 230, 118, (pulse_alpha * 255.0) as u8);
+                                ui.label(egui::RichText::new(format!("{} % (Charging ⚡)", bat))
+                                    .color(pulse_color)
+                                    .size(13.0)
                                     .strong());
                             } else {
                                 let fill_w = (rect.width() * (bat as f32 / 100.0)).clamp(4.0, rect.width());
                                 let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height()));
-                                ui.painter().rect_filled(fill_rect, 4.0, dark_green);
+                                ui.painter().rect_filled(fill_rect, 2.0, neon_green);
                                 ui.label(egui::RichText::new(format!("{} %", bat))
-                                    .color(dark_green)
-                                    .size(12.0)
+                                    .color(neon_green)
+                                    .size(13.0)
                                     .strong());
                             }
                         });
@@ -1053,28 +1448,43 @@ impl eframe::App for RedragonApp {
 
                         ui.heading("Mouse Parameter Tuning");
                         ui.add_space(6.0);
+                        let mut params_changed = false;
                         ui.horizontal(|ui| {
                             ui.label("Mouse sensitivity:");
-                            ui.add_sized([220.0, 18.0], egui::Slider::new(&mut active_profile.mouse_sensitivity, 1..=20));
+                            if ui.add_sized([220.0, 18.0], egui::Slider::new(&mut active_profile.mouse_sensitivity, 1..=20)).changed() {
+                                params_changed = true;
+                            }
                             ui.label(format!("{}", active_profile.mouse_sensitivity));
                         });
-                        ui.checkbox(&mut active_profile.enhance_pointer_precision, "Improve pointer precision");
+                        if ui.checkbox(&mut active_profile.enhance_pointer_precision, "Improve pointer precision").changed() {
+                            params_changed = true;
+                        }
 
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label("Scrolling speed:");
-                            ui.add_sized([220.0, 18.0], egui::Slider::new(&mut active_profile.scroll_speed, 1..=10));
+                            if ui.add_sized([220.0, 18.0], egui::Slider::new(&mut active_profile.scroll_speed, 1..=10)).changed() {
+                                params_changed = true;
+                            }
                             ui.label(format!("{}", active_profile.scroll_speed));
                         });
-                        ui.checkbox(&mut active_profile.scroll_one_page, "Scroll one page");
+                        if ui.checkbox(&mut active_profile.scroll_one_page, "Scroll one page").changed() {
+                            params_changed = true;
+                        }
 
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label("Double-click speed:");
                             ui.label("Slow");
-                            ui.add_sized([180.0, 18.0], egui::Slider::new(&mut active_profile.double_click_speed, 1..=10));
+                            if ui.add_sized([180.0, 18.0], egui::Slider::new(&mut active_profile.double_click_speed, 1..=10)).changed() {
+                                params_changed = true;
+                            }
                             ui.label("Fast");
                         });
+
+                        if params_changed {
+                            hardware::apply_mouse_parameters(active_profile);
+                        }
                     });
                 }
 
@@ -1358,14 +1768,12 @@ impl eframe::App for RedragonApp {
                                     LedEffect::Steady => "Steady",
                                     LedEffect::Respiration => "Respiration",
                                     LedEffect::Neon => "Neon",
-                                    LedEffect::Streaming => "Streaming",
                                     LedEffect::Off => "OFF",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut active_profile.led_effect, LedEffect::Steady, "Steady");
                                     ui.selectable_value(&mut active_profile.led_effect, LedEffect::Respiration, "Respiration");
                                     ui.selectable_value(&mut active_profile.led_effect, LedEffect::Neon, "Neon");
-                                    ui.selectable_value(&mut active_profile.led_effect, LedEffect::Streaming, "Streaming");
                                     ui.selectable_value(&mut active_profile.led_effect, LedEffect::Off, "OFF");
                                 });
 
@@ -1532,6 +1940,9 @@ impl eframe::App for RedragonApp {
                             self.status_msg = format!("Bus rescanned: {} (Battery {}%)", self.bridge.device_name, self.bridge.battery_percent);
                             let lvl = if self.bridge.connected { LogLevel::Success } else { LogLevel::Warn };
                             self.add_log(lvl, format!("Manual bus probe: {}", self.bridge.last_status_detail));
+                            if self.bridge.connected {
+                                self.ingest_device_config();
+                            }
                         }
                     });
 
@@ -1671,6 +2082,184 @@ impl eframe::App for RedragonApp {
                             });
                         });
                 });
+        }
+
+        // 5. KEY COMBINATION MODAL (Image 3)
+        if self.show_key_combo_modal {
+            let mut close_modal = false;
+            let b_num = self.key_combo_btn_idx + 1;
+            let mut save_combo = false;
+
+            egui::Area::new("key_combo_backdrop".into())
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .order(egui::Order::Middle)
+                .show(ctx, |ui| {
+                    let screen_rect = ctx.screen_rect();
+                    ui.painter().rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(150));
+                });
+
+            egui::Window::new(format!("Button {} - Key Combination", b_num))
+                .id(egui::Id::new("key_combo_window"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .fixed_size(egui::vec2(360.0, 160.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Please enter keystroke:").size(13.0));
+                    ui.add_space(6.0);
+
+                    // White text box with black text matching Image 3
+                    let edit = egui::TextEdit::singleline(&mut self.key_combo_key)
+                        .text_color(egui::Color32::BLACK)
+                        .margin(egui::Margin::symmetric(8.0, 6.0))
+                        .min_size(egui::vec2(320.0, 26.0));
+                    let resp = ui.add(edit);
+                    if resp.gained_focus() || self.key_combo_key.is_empty() {
+                        resp.request_focus();
+                    }
+
+                    // Key capture listener
+                    let events = ui.input(|i| i.raw.events.clone());
+                    for event in events {
+                        if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event {
+                            if key != egui::Key::Escape && key != egui::Key::Enter {
+                                self.key_combo_shift = modifiers.shift;
+                                self.key_combo_ctrl = modifiers.ctrl;
+                                self.key_combo_alt = modifiers.alt;
+                                self.key_combo_win = modifiers.mac_cmd;
+                                self.key_combo_key = format!("{:?}", key);
+                            } else if key == egui::Key::Escape {
+                                close_modal = true;
+                            } else if key == egui::Key::Enter {
+                                save_combo = true;
+                            }
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.key_combo_shift, "Shift");
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut self.key_combo_ctrl, "Ctrl");
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut self.key_combo_alt, "Alt");
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut self.key_combo_win, "Win");
+                    });
+
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("  Cancel  ").clicked() {
+                                close_modal = true;
+                            }
+                            if ui.button(egui::RichText::new("    OK    ").strong()).clicked() || save_combo {
+                                let mut mods = Vec::new();
+                                if self.key_combo_ctrl { mods.push("Ctrl"); }
+                                if self.key_combo_shift { mods.push("Shift"); }
+                                if self.key_combo_alt { mods.push("Alt"); }
+                                if self.key_combo_win { mods.push("Win"); }
+
+                                let key_trimmed = self.key_combo_key.trim();
+                                let final_action = if mods.is_empty() && key_trimmed.is_empty() {
+                                    "Key combination".to_string()
+                                } else if mods.is_empty() {
+                                    format!("Combo: {}", key_trimmed)
+                                } else if key_trimmed.is_empty() {
+                                    format!("Combo: {}", mods.join("+"))
+                                } else {
+                                    format!("Combo: {}+{}", mods.join("+"), key_trimmed)
+                                };
+
+                                self.profiles[self.active_profile_idx].button_actions[self.key_combo_btn_idx] = final_action;
+                                close_modal = true;
+                            }
+                        });
+                    });
+                });
+
+            if close_modal {
+                self.show_key_combo_modal = false;
+            }
+        }
+
+        // 6. MACRO LIST MODAL (Image 4)
+        if self.show_macro_list_modal {
+            let mut close_modal = false;
+            let b_num = self.macro_modal_btn_idx + 1;
+
+            egui::Area::new("macro_list_backdrop".into())
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .order(egui::Order::Middle)
+                .show(ctx, |ui| {
+                    let screen_rect = ctx.screen_rect();
+                    ui.painter().rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(150));
+                });
+
+            egui::Window::new(format!("Button {} - Macro List", b_num))
+                .id(egui::Id::new("macro_list_window"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .fixed_size(egui::vec2(380.0, 240.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Macro list").strong().size(13.0));
+                    ui.add_space(6.0);
+
+                    // Dark framed list box matching Image 4
+                    egui::Frame::group(ui.style())
+                        .fill(egui::Color32::from_rgb(18, 18, 22))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 60)))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(130.0)
+                                .min_scrolled_height(130.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    if self.macros.is_empty() {
+                                        ui.label(egui::RichText::new("(No macros available)").italics().color(egui::Color32::GRAY));
+                                    } else {
+                                        for m in &self.macros {
+                                            let is_selected = self.selected_macro_modal_name == m.name;
+                                            let label = egui::SelectableLabel::new(
+                                                is_selected,
+                                                egui::RichText::new(&m.name).strong(),
+                                            );
+                                            if ui.add_sized([ui.available_width(), 24.0], label).clicked() {
+                                                self.selected_macro_modal_name = m.name.clone();
+                                            }
+                                        }
+                                    }
+                                });
+                        });
+
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(" Cancel ").clicked() {
+                                close_modal = true;
+                            }
+                            if ui.button(egui::RichText::new("   OK   ").strong()).clicked() {
+                                if !self.selected_macro_modal_name.is_empty() {
+                                    self.profiles[self.active_profile_idx].button_actions[self.macro_modal_btn_idx] =
+                                        format!("Macro - {}", self.selected_macro_modal_name);
+                                }
+                                close_modal = true;
+                            }
+                        });
+                    });
+                });
+
+            if close_modal {
+                self.show_macro_list_modal = false;
+            }
         }
     }
 }
