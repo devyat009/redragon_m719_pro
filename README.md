@@ -27,6 +27,38 @@ This software completely replaces the proprietary OEM drivers (`OemDrv.exe` / `L
 
 ---
 
+## Screenshots & UI Overview
+
+### 1. Main View — Button Mapping, Polling Rate & Battery
+Interactive coordinate overlay with custom button remapping (1–8), USB polling rate selector (125Hz – 1000Hz), onboard profile manager, and live wireless RF connection / battery status.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/devyat009/image-repo-for-my-repo/refs/heads/main/redragon_m719_pro/img1.png" alt="Main View - Button Mapping, Polling Rate and Battery" width="90%"/>
+</p>
+
+### 2. Advanced View — DPI Stages, Mouse Parameters & Indicator Effects
+5-stage DPI calibration (100 to 10,000 DPI in 100 DPI steps), independent X/Y axis sensitivity, system pointer speed, scroll speed, double-click speed, and DPI RGB LED indicator effects.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/devyat009/image-repo-for-my-repo/refs/heads/main/redragon_m719_pro/img2.png" alt="Advanced View - DPI Changes, Mouse Parameters and DPI RGB Effect" width="90%"/>
+</p>
+
+### 3. Lighting View — RGB Configuration
+Complete lighting control featuring 5 distinct modes (Steady, Respiration, Neon, Streaming, Off), 10-level brightness and animation speed sliders, custom RGB color wheel, and 10-slot palette presets.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/devyat009/image-repo-for-my-repo/refs/heads/main/redragon_m719_pro/img4.png" alt="Lighting View - RGB Lighting Configuration" width="90%"/>
+</p>
+
+### 4. Settings View — Mouse Information & Diagnostics
+Detailed hardware specifications, firmware info, link status (2.4GHz RF / USB Wired), Windows startup configuration, and integrated real-time USB HID diagnostic console.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/devyat009/image-repo-for-my-repo/refs/heads/main/redragon_m719_pro/img5.png" alt="Settings View - Mouse Information and Diagnostics" width="90%"/>
+</p>
+
+---
+
 ## Key Features
 
 - **Direct Hardware Communication:**
