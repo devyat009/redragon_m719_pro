@@ -3,13 +3,17 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
 
+#[cfg(windows)]
 use windows::core::w;
+#[cfg(windows)]
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+#[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, EndPaint,
     FillRect, FrameRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TextOutW,
     FW_BOLD, HBRUSH, PAINTSTRUCT, TRANSPARENT,
 };
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostMessageW,
     PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
@@ -18,7 +22,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
+#[cfg(windows)]
 const WM_SHOW_DPI: u32 = WM_USER + 101;
+#[cfg(windows)]
 const TIMER_FADE: usize = 1;
 
 #[derive(Debug, Clone)]
@@ -70,6 +76,45 @@ struct WindowState {
 
 static GLOBAL_STATE: Mutex<Option<WindowState>> = Mutex::new(None);
 
+#[cfg(not(windows))]
+pub fn get_active_osd() -> Option<(DpiDisplayInfo, f32)> {
+    if let Ok(mut lock) = GLOBAL_STATE.lock() {
+        if let Some(state) = lock.as_mut() {
+            let elapsed = state.show_time.elapsed().as_secs_f32();
+            if elapsed > 2.1 {
+                *lock = None;
+                return None;
+            } else if elapsed > 1.6 {
+                let ratio = (1.0 - (elapsed - 1.6) / 0.5).clamp(0.0, 1.0);
+                state.alpha = (ratio * 235.0) as u8;
+                return Some((state.info.clone(), ratio));
+            } else {
+                return Some((state.info.clone(), 1.0));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn run_overlay_window(rx: Receiver<OsdCommand>) {
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            OsdCommand::Show(info) => {
+                if let Ok(mut lock) = GLOBAL_STATE.lock() {
+                    *lock = Some(WindowState {
+                        info,
+                        show_time: Instant::now(),
+                        alpha: 235,
+                    });
+                }
+            }
+            OsdCommand::Quit => break,
+        }
+    }
+}
+
+#[cfg(windows)]
 fn run_overlay_window(rx: Receiver<OsdCommand>) {
     unsafe {
         let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
@@ -166,6 +211,7 @@ fn run_overlay_window(rx: Receiver<OsdCommand>) {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn osd_wnd_proc(
     hwnd: HWND,
     msg: u32,

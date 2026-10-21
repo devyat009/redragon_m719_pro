@@ -8,10 +8,13 @@ use std::time::Instant;
 use eframe::egui;
 use hardware::{parse_jmk_bytes, DpiEffect, HardwareBridge, HardwareEvent, LedEffect, MacroItem, MouseProfile, PollingRate, DEFAULT_PID_WIRED, DEFAULT_PID_WIRELESS};
 use overlay::OsdController;
+#[cfg(not(all(target_os = "linux", target_arch = "x86")))]
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86"))]
+struct TrayIcon;
 
 const MOUSE_PNG_BYTES: &[u8] = include_bytes!("../assets/mouse.png");
 const LOGO_PNG_BYTES: &[u8] = include_bytes!("../assets/logo1.png");
@@ -112,6 +115,7 @@ fn show_main_window() {
 #[cfg(not(windows))]
 fn show_main_window() {}
 
+#[cfg(windows)]
 fn is_autostart_enabled() -> bool {
     let output = std::process::Command::new("reg")
         .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "RedragonInvaderPro"])
@@ -119,6 +123,30 @@ fn is_autostart_enabled() -> bool {
     matches!(output, Ok(o) if o.status.success())
 }
 
+#[cfg(target_os = "linux")]
+fn is_autostart_enabled() -> bool {
+    if let Ok(home) = std::env::var("HOME") {
+        let p = std::path::Path::new(&home).join(".config/autostart/redragon_m719_pro.desktop");
+        return p.exists();
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn is_autostart_enabled() -> bool {
+    if let Ok(home) = std::env::var("HOME") {
+        let p = std::path::Path::new(&home).join("Library/LaunchAgents/com.redragon.m719pro.plist");
+        return p.exists();
+    }
+    false
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn is_autostart_enabled() -> bool {
+    false
+}
+
+#[cfg(windows)]
 fn set_autostart(enable: bool) {
     if enable {
         if let Ok(exe) = std::env::current_exe() {
@@ -150,12 +178,56 @@ fn set_autostart(enable: bool) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn set_autostart(enable: bool) {
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = std::path::Path::new(&home).join(".config/autostart");
+        let file_path = dir.join("redragon_m719_pro.desktop");
+        if enable {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::fs::create_dir_all(&dir);
+                let desktop_entry = format!(
+                    "[Desktop Entry]\nType=Application\nName=Redragon INVADER PRO Suite\nExec=\"{}\"\nTerminal=false\nCategories=Utility;Settings;\n",
+                    exe.to_string_lossy()
+                );
+                let _ = std::fs::write(file_path, desktop_entry);
+            }
+        } else {
+            let _ = std::fs::remove_file(file_path);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_autostart(enable: bool) {
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = std::path::Path::new(&home).join("Library/LaunchAgents");
+        let file_path = dir.join("com.redragon.m719pro.plist");
+        if enable {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::fs::create_dir_all(&dir);
+                let plist = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>com.redragon.m719pro</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>{}</string>\n    </array>\n    <key>RunAtLoad</key>\n    <true/>\n</dict>\n</plist>\n",
+                    exe.to_string_lossy()
+                );
+                let _ = std::fs::write(file_path, plist);
+            }
+        } else {
+            let _ = std::fs::remove_file(file_path);
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn set_autostart(_enable: bool) {}
+
 #[derive(Clone, Copy, PartialEq)]
 enum TrayAction {
     Show,
     Hide,
 }
 
+#[cfg(not(all(target_os = "linux", target_arch = "x86")))]
 fn build_tray() -> (Option<TrayIcon>, std::sync::mpsc::Receiver<TrayAction>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let menu = Menu::new();
@@ -201,6 +273,12 @@ fn build_tray() -> (Option<TrayIcon>, std::sync::mpsc::Receiver<TrayAction>) {
     } else {
         (None, rx)
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86"))]
+fn build_tray() -> (Option<TrayIcon>, std::sync::mpsc::Receiver<TrayAction>) {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    (None, rx)
 }
 
 struct RedragonApp {
@@ -354,35 +432,7 @@ impl Default for RedragonApp {
             profiles.push(p);
         }
 
-        let macros = vec![
-            MacroItem {
-                name: "40ms".to_string(),
-                key_events: vec![
-                    "Key Down: L-Button".to_string(),
-                    "Delay: 40ms".to_string(),
-                    "Key Up: L-Button".to_string(),
-                ],
-            },
-            MacroItem {
-                name: "fast".to_string(),
-                key_events: vec![
-                    "Key Down: R-Button".to_string(),
-                    "Delay: 20ms".to_string(),
-                    "Key Up: R-Button".to_string(),
-                ],
-            },
-            MacroItem {
-                name: "JUMPSHOT".to_string(),
-                key_events: vec![
-                    "Key Down: Space".to_string(),
-                    "Delay: 35ms".to_string(),
-                    "Key Down: L-Button".to_string(),
-                    "Delay: 50ms".to_string(),
-                    "Key Up: L-Button".to_string(),
-                    "Key Up: Space".to_string(),
-                ],
-            },
-        ];
+        let macros = hardware::load_oem_macros();
 
         let autostart = is_autostart_enabled();
         let (tray, tray_rx) = build_tray();
@@ -515,6 +565,7 @@ impl eframe::App for RedragonApp {
         }
 
         // Handle Tray Icon Events
+        #[cfg(not(all(target_os = "linux", target_arch = "x86")))]
         if let Ok(event) = TrayIconEvent::receiver().try_recv() {
             match event {
                 TrayIconEvent::Click { button: tray_icon::MouseButton::Left, .. } | TrayIconEvent::DoubleClick { .. } => {
@@ -604,6 +655,7 @@ impl eframe::App for RedragonApp {
                 || self.bridge.is_charging != self.prev_charging
                 || self.bridge.is_wireless != self.prev_wireless
             {
+                let newly_connected = self.bridge.connected && !self.prev_connected;
                 if self.bridge.connected {
                     if self.bridge.is_charging {
                         self.add_log(LogLevel::Status, format!("Mouse plugged in: Charging via USB (Battery: {}%)", self.bridge.battery_percent));
@@ -612,7 +664,9 @@ impl eframe::App for RedragonApp {
                     } else {
                         self.add_log(LogLevel::Status, format!("Mouse connected via Wired USB (Battery: {}%)", self.bridge.battery_percent));
                     }
-                    self.ingest_device_config();
+                    if newly_connected {
+                        self.ingest_device_config();
+                    }
                 } else if self.bridge.found_dongle {
                     self.add_log(LogLevel::Warn, "Mouse link lost: 2.4G receiver is plugged in, but mouse switch was turned OFF or entered standby sleep.");
                 } else {
@@ -794,108 +848,117 @@ impl eframe::App for RedragonApp {
         egui::TopBottomPanel::bottom("bottom_bar")
             .exact_height(54.0)
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    if ui.button("Import Profile").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Redragon Profile (*.json, *.jmk)", &["json", "jmk"])
-                            .pick_file() {
-                            if let Ok(bytes) = fs::read(&path) {
-                                let mut imported = false;
-                                if let Ok(json_str) = String::from_utf8(bytes.clone()) {
-                                    if let Ok(prof) = serde_json::from_str::<MouseProfile>(&json_str) {
-                                        self.profiles[self.active_profile_idx] = prof;
-                                        self.sync_dpi_stages_cache();
-                                        self.status_msg = "Profile loaded from JSON!".to_string();
-                                        self.add_log(LogLevel::Success, format!("Profile loaded from JSON file: {:?}", path.file_name().unwrap_or_default()));
-                                        imported = true;
+                ui.add_enabled_ui(!self.action_menu_open, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        if ui.button("Import Profile").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Redragon Profile (*.json, *.jmk)", &["json", "jmk"])
+                                .pick_file() {
+                                if let Ok(bytes) = fs::read(&path) {
+                                    let mut imported = false;
+                                    if let Ok(json_str) = String::from_utf8(bytes.clone()) {
+                                        if let Ok(prof) = serde_json::from_str::<MouseProfile>(&json_str) {
+                                            self.profiles[self.active_profile_idx] = prof;
+                                            self.sync_dpi_stages_cache();
+                                            self.status_msg = "Profile loaded from JSON!".to_string();
+                                            self.add_log(LogLevel::Success, format!("Profile loaded from JSON file: {:?}", path.file_name().unwrap_or_default()));
+                                            imported = true;
+                                        }
                                     }
-                                }
-                                if !imported {
-                                    if let Some(loaded_jmk) = parse_jmk_bytes(&bytes) {
-                                        self.profiles[self.active_profile_idx] = loaded_jmk;
-                                        self.sync_dpi_stages_cache();
-                                        self.status_msg = "Original JMK profile loaded successfully!".to_string();
-                                        self.add_log(LogLevel::Success, format!("Original JMK binary profile loaded: {:?}", path.file_name().unwrap_or_default()));
-                                        imported = true;
+                                    if !imported {
+                                        if let Some(loaded_jmk) = parse_jmk_bytes(&bytes) {
+                                            self.profiles[self.active_profile_idx] = loaded_jmk;
+                                            self.sync_dpi_stages_cache();
+                                            self.status_msg = "Original JMK profile loaded successfully!".to_string();
+                                            self.add_log(LogLevel::Success, format!("Original JMK binary profile loaded: {:?}", path.file_name().unwrap_or_default()));
+                                            imported = true;
+                                        }
                                     }
-                                }
-                                if !imported {
-                                    self.status_msg = "Unrecognized profile format.".to_string();
-                                    self.add_log(LogLevel::Error, "Failed to parse imported profile file format.");
+                                    if !imported {
+                                        self.status_msg = "Unrecognized profile format.".to_string();
+                                        self.add_log(LogLevel::Error, "Failed to parse imported profile file format.");
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if ui.button("Export Profile").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("profile.jmk")
-                            .add_filter("JMK Binary Profile (*.jmk)", &["jmk"])
-                            .add_filter("JSON Profile (*.json)", &["json"])
-                            .save_file() {
-                            let is_jmk = path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("jmk")).unwrap_or(false);
-                            if is_jmk {
-                                let bytes = hardware::export_jmk_bytes(&self.profiles[self.active_profile_idx], self.active_profile_idx);
-                                let _ = fs::write(&path, bytes);
-                                self.status_msg = "Profile exported as OEM JMK binary format!".to_string();
-                                self.add_log(LogLevel::Success, format!("Active Profile {} exported as JMK: {:?}", self.active_profile_idx + 1, path.file_name().unwrap_or_default()));
-                            } else {
-                                let json = serde_json::to_string_pretty(&self.profiles[self.active_profile_idx]).unwrap_or_default();
-                                let _ = fs::write(&path, json);
-                                self.status_msg = "Profile exported!".to_string();
-                                self.add_log(LogLevel::Success, format!("Active Profile {} exported to JSON: {:?}", self.active_profile_idx + 1, path.file_name().unwrap_or_default()));
+                        if ui.button("Export Profile").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_file_name("profile.jmk")
+                                .add_filter("JMK Binary Profile (*.jmk)", &["jmk"])
+                                .add_filter("JSON Profile (*.json)", &["json"])
+                                .save_file() {
+                                let is_jmk = path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("jmk")).unwrap_or(false);
+                                if is_jmk {
+                                    let bytes = hardware::export_jmk_bytes(&self.profiles[self.active_profile_idx], self.active_profile_idx);
+                                    let _ = fs::write(&path, bytes);
+                                    self.status_msg = "Profile exported as OEM JMK binary format!".to_string();
+                                    self.add_log(LogLevel::Success, format!("Active Profile {} exported as JMK: {:?}", self.active_profile_idx + 1, path.file_name().unwrap_or_default()));
+                                } else {
+                                    let json = serde_json::to_string_pretty(&self.profiles[self.active_profile_idx]).unwrap_or_default();
+                                    let _ = fs::write(&path, json);
+                                    self.status_msg = "Profile exported!".to_string();
+                                    self.add_log(LogLevel::Success, format!("Active Profile {} exported to JSON: {:?}", self.active_profile_idx + 1, path.file_name().unwrap_or_default()));
+                                }
                             }
                         }
-                    }
 
-                    ui.separator();
+                        ui.separator();
 
-                    if ui.button("Restore").clicked() {
-                        self.profiles[self.active_profile_idx] = MouseProfile::default();
-                        self.status_msg = "Reset to default profile.".to_string();
-                        self.add_log(LogLevel::Info, format!("Profile {} restored to factory default parameters.", self.active_profile_idx + 1));
-                    }
+                        if ui.button("Restore").clicked() {
+                            self.profiles[self.active_profile_idx] = MouseProfile::default();
+                            self.status_msg = "Reset to default profile.".to_string();
+                            self.add_log(LogLevel::Info, format!("Profile {} restored to factory default parameters.", self.active_profile_idx + 1));
+                        }
 
-                    let is_applying = self.apply_progress.is_some();
-                    let apply_btn = egui::Button::new(
-                        egui::RichText::new(if is_applying { "Applying..." } else { "Apply" })
-                            .color(egui::Color32::WHITE)
-                            .strong(),
-                    ).fill(if is_applying { egui::Color32::from_rgb(100, 100, 100) } else { accent });
+                        let is_applying = self.apply_progress.is_some();
+                        let apply_btn = egui::Button::new(
+                            egui::RichText::new(if is_applying { "Applying..." } else { "Apply" })
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        ).fill(if is_applying { egui::Color32::from_rgb(100, 100, 100) } else { accent });
 
-                    if ui.add_enabled(!is_applying, apply_btn).clicked() {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        self.apply_rx = Some(rx);
-                        self.apply_progress = Some((0.05, "Initializing hardware sync...".to_string()));
-                        self.status_msg = "Applying settings to mouse...".to_string();
+                        if ui.add_enabled(!is_applying, apply_btn).clicked() {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.apply_rx = Some(rx);
+                            self.apply_progress = Some((0.05, "Initializing hardware sync...".to_string()));
+                            self.status_msg = "Applying settings to mouse...".to_string();
 
-                        let profile_to_apply = self.profiles[self.active_profile_idx].clone();
-                        let active_idx = self.active_profile_idx;
-                        let vid = self.bridge.vid;
+                            let profile_to_apply = self.profiles[self.active_profile_idx].clone();
+                            let macros_to_apply = self.macros.clone();
+                            let active_idx = self.active_profile_idx;
+                            let vid = self.bridge.vid;
 
-                        std::thread::spawn(move || {
-                            let tx_cb = tx.clone();
-                            let res = HardwareBridge::apply_profile_direct(vid, &profile_to_apply, active_idx, move |pct, step| {
-                                let _ = tx_cb.send((pct, step.to_string()));
+                            std::thread::spawn(move || {
+                                let tx_cb = tx.clone();
+                                let res = HardwareBridge::apply_profile_direct(
+                                    vid,
+                                    &profile_to_apply,
+                                    active_idx,
+                                    &macros_to_apply,
+                                    move |pct, step| {
+                                        let _ = tx_cb.send((pct, step.to_string()));
+                                    },
+                                );
+                                match res {
+                                    Ok(_) => {
+                                        let _ = tx.send((1.0, "SUCCESS: Settings saved to hardware EEPROM!".to_string()));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send((-1.0, format!("ERROR: {}", e)));
+                                    }
+                                }
                             });
-                            match res {
-                                Ok(_) => {
-                                    let _ = tx.send((1.0, "SUCCESS: Settings saved to hardware EEPROM!".to_string()));
-                                }
-                                Err(e) => {
-                                    let _ = tx.send((-1.0, format!("ERROR: {}", e)));
-                                }
-                            }
+                        }
+
+                        if ui.button("Cancel").clicked() {
+                            self.status_msg = "Operation cancelled.".to_string();
+                            self.add_log(LogLevel::Info, "Changes cancelled by user.");
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(&self.status_msg).color(egui::Color32::from_rgb(0, 200, 255)));
                         });
-                    }
-
-                    if ui.button("Cancel").clicked() {
-                        self.status_msg = "Operation cancelled.".to_string();
-                        self.add_log(LogLevel::Info, "Changes cancelled by user.");
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(&self.status_msg).color(egui::Color32::from_rgb(0, 200, 255)));
                     });
                 });
             });
@@ -1075,7 +1138,8 @@ impl eframe::App for RedragonApp {
                             }
 
                             let row_h = 24.0;
-                            let menu_min = egui::pos2(btn_rect.min.x, btn_rect.max.y + 2.0);
+                            let max_menu_y = (ctx.screen_rect().max.y - 58.0 - 14.0 * row_h).max(40.0);
+                            let menu_min = egui::pos2(btn_rect.min.x, (btn_rect.max.y + 2.0).min(max_menu_y));
                             let menu_rect = egui::Rect::from_min_size(menu_min, egui::vec2(210.0, 14.0 * row_h));
                             let dpi_sub_pos = egui::pos2(menu_rect.max.x + 1.0, menu_min.y + 12.0 * row_h);
                             let dpi_sub_rect = egui::Rect::from_min_size(dpi_sub_pos, egui::vec2(140.0, 3.0 * row_h));
@@ -1301,29 +1365,31 @@ impl eframe::App for RedragonApp {
                         ui.add_space(6.0);
 
                         // USB Polling Rate slider
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("USB Polling Rate").strong());
-                            let mut rate_val = match active_profile.polling_rate {
-                                PollingRate::Hz125 => 1,
-                                PollingRate::Hz250 => 2,
-                                PollingRate::Hz500 => 3,
-                                PollingRate::Hz1000 => 4,
-                            };
-                            let slider = egui::Slider::new(&mut rate_val, 1..=4)
-                                .custom_formatter(|n, _| match n as i32 {
-                                    1 => "125 Hz".to_string(),
-                                    2 => "250 Hz".to_string(),
-                                    3 => "500 Hz".to_string(),
-                                    _ => "1000 Hz".to_string(),
-                                });
-                            if ui.add(slider).changed() {
-                                active_profile.polling_rate = match rate_val {
-                                    1 => PollingRate::Hz125,
-                                    2 => PollingRate::Hz250,
-                                    3 => PollingRate::Hz500,
-                                    _ => PollingRate::Hz1000,
+                        ui.add_enabled_ui(!self.action_menu_open, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("USB Polling Rate").strong());
+                                let mut rate_val = match active_profile.polling_rate {
+                                    PollingRate::Hz125 => 1,
+                                    PollingRate::Hz250 => 2,
+                                    PollingRate::Hz500 => 3,
+                                    PollingRate::Hz1000 => 4,
                                 };
-                            }
+                                let slider = egui::Slider::new(&mut rate_val, 1..=4)
+                                    .custom_formatter(|n, _| match n as i32 {
+                                        1 => "125 Hz".to_string(),
+                                        2 => "250 Hz".to_string(),
+                                        3 => "500 Hz".to_string(),
+                                        _ => "1000 Hz".to_string(),
+                                    });
+                                if ui.add(slider).changed() {
+                                    active_profile.polling_rate = match rate_val {
+                                        1 => PollingRate::Hz125,
+                                        2 => PollingRate::Hz250,
+                                        3 => PollingRate::Hz500,
+                                        _ => PollingRate::Hz1000,
+                                    };
+                                }
+                            });
                         });
 
                         ui.add_space(8.0);
@@ -1338,7 +1404,7 @@ impl eframe::App for RedragonApp {
                             ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(18, 20, 24));
                             ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(45, 48, 58)));
 
-                            if bat_resp.clicked() {
+                            if !self.action_menu_open && bat_resp.clicked() {
                                 self.bridge.is_charging = !self.bridge.is_charging;
                             }
                             bat_resp.on_hover_text(if self.bridge.is_charging {
@@ -2261,6 +2327,56 @@ impl eframe::App for RedragonApp {
                 self.show_macro_list_modal = false;
             }
         }
+
+        // Cross-platform fallback OSD overlay for Linux and macOS
+        #[cfg(not(windows))]
+        if let Some((info, alpha)) = overlay::get_active_osd() {
+            ctx.request_repaint();
+            egui::Area::new(egui::Id::new("cross_platform_dpi_osd"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(20.0, 45.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    let a = (alpha * 235.0) as u8;
+                    let [r, g, b] = info.color_rgb;
+                    let stage_col = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                    let bg_col = egui::Color32::from_rgba_unmultiplied(20, 22, 28, a);
+                    let white_col = egui::Color32::from_rgba_unmultiplied(255, 255, 255, a);
+                    let gray_col = egui::Color32::from_rgba_unmultiplied(48, 56, 64, a);
+
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(210.0, 95.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 7.0, bg_col);
+                    ui.painter().rect_stroke(rect, 7.0, egui::Stroke::new(1.2_f32, stage_col));
+
+                    let stripe = egui::Rect::from_min_size(rect.min, egui::vec2(6.0, 95.0));
+                    ui.painter().rect_filled(stripe, 3.0, stage_col);
+
+                    ui.painter().text(
+                        egui::pos2(rect.min.x + 20.0, rect.min.y + 18.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("DPI STAGE {}", info.stage),
+                        egui::FontId::proportional(13.0),
+                        stage_col,
+                    );
+                    ui.painter().text(
+                        egui::pos2(rect.min.x + 20.0, rect.min.y + 46.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{} DPI", info.dpi_val),
+                        egui::FontId::proportional(24.0),
+                        white_col,
+                    );
+
+                    for s in 1..=5 {
+                        let seg_x = rect.min.x + 20.0 + ((s - 1) as f32 * 34.0);
+                        let seg_rect = egui::Rect::from_min_size(
+                            egui::pos2(seg_x, rect.min.y + 74.0),
+                            egui::vec2(28.0, 6.0),
+                        );
+                        let bar_col = if s == info.stage { stage_col } else { gray_col };
+                        ui.painter().rect_filled(seg_rect, 1.0, bar_col);
+                    }
+                });
+        }
     }
 }
 
@@ -2314,29 +2430,42 @@ fn main() -> eframe::Result<()> {
         "Redragon INVADER PRO Suite",
         options,
         Box::new(|cc| {
-            // Register lightweight Segoe UI and Segoe UI Symbol fonts from Windows (< 1MB each)
             let mut fonts = egui::FontDefinitions::default();
-            if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
-                fonts.font_data.insert(
-                    "segoeui".to_owned(),
-                    egui::FontData::from_owned(font_data),
-                );
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "segoeui".to_owned());
-            }
-            if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
-                fonts.font_data.insert(
-                    "seguisym".to_owned(),
-                    egui::FontData::from_owned(font_data),
-                );
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .push("seguisym".to_owned());
+
+            #[cfg(windows)]
+            let font_candidates: &[(&str, &str, bool)] = &[
+                ("segoeui", "C:\\Windows\\Fonts\\segoeui.ttf", true),
+                ("seguisym", "C:\\Windows\\Fonts\\seguisym.ttf", false),
+            ];
+            #[cfg(target_os = "macos")]
+            let font_candidates: &[(&str, &str, bool)] = &[
+                ("sfns", "/System/Library/Fonts/SFNS.ttf", true),
+                ("applesymbols", "/System/Library/Fonts/Apple Symbols.ttf", false),
+            ];
+            #[cfg(target_os = "linux")]
+            let font_candidates: &[(&str, &str, bool)] = &[
+                ("dejavu", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", true),
+                ("noto", "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf", false),
+            ];
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+            let font_candidates: &[(&str, &str, bool)] = &[];
+
+            for &(name, path, primary) in font_candidates {
+                if let Ok(font_data) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        name.to_owned(),
+                        egui::FontData::from_owned(font_data),
+                    );
+                    let list = fonts
+                        .families
+                        .entry(egui::FontFamily::Proportional)
+                        .or_default();
+                    if primary {
+                        list.insert(0, name.to_owned());
+                    } else {
+                        list.push(name.to_owned());
+                    }
+                }
             }
             cc.egui_ctx.set_fonts(fonts);
 

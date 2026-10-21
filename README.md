@@ -1,14 +1,14 @@
 # Redragon INVADER PRO Suite (M719RGB-PRO)
 
 [![Rust](https://img.shields.io/badge/Language-Rust%202021-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-blue.svg?style=flat-square&logo=windows)](https://microsoft.com/windows)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg?style=flat-square)](#multiplatform-build--artifact-naming)
 [![Sensor](https://img.shields.io/badge/Sensor-PixArt%20PAW3325-red.svg?style=flat-square)](#hardware-specifications)
 [![Framework](https://img.shields.io/badge/GUI-egui%20%2F%20eframe-darkgreen.svg?style=flat-square)](https://github.com/emilk/egui)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg?style=flat-square)](LICENSE)
 
-A high-performance, lightweight, and bloat-free open-source control suite for the **Redragon INVADER PRO (M719RGB-PRO)** gaming mouse, written from scratch in Rust.
+A high-performance, lightweight open-source control suite for the **Redragon INVADER PRO (M719RGB-PRO)** gaming mouse, written from scratch in Rust.
 
-This software completely replaces the proprietary OEM drivers (`OemDrv.exe` / `Lowerdev.dll`), communicating directly with the mouse MCU over raw USB Human Interface Device (HID) feature reports without requiring third-party background services or Electron dependencies.
+This software completely replaces the proprietary OEM drivers (`OemDrv.exe` / `Lowerdev.dll`), communicating directly with the mouse MCU over raw USB Human Interface Device (HID) feature reports.
 
 ---
 
@@ -101,35 +101,54 @@ Communication with the onboard controller is performed over USB HID Feature Repo
 
 ---
 
-## Prerequisites
+## Multiplatform Build & Artifact Naming
 
-Before building the application on Windows, verify that the following tools are installed:
+The suite compiles across **Windows**, **Linux**, and **macOS** (both 64-bit and 32-bit / Apple Silicon). Release artifacts follow the international standard `<app>-<os>-<arch>` naming convention in the `dist/` directory:
 
-1. **Rust Toolchain (2021 edition or newer):**
-   Install via [rustup.rs](https://rustup.rs/):
-   ```powershell
-   winget install Rustlang.Rustup
-   ```
+| Operating System | Architecture | Rust Target Triple | Standardized Output Filename |
+|---|---|---|---|
+| **Windows** | 64-bit (`x64`) | `x86_64-pc-windows-msvc` | `redragon_m719_pro-windows-x64.exe` |
+| **Windows** | 32-bit (`x86`) | `i686-pc-windows-msvc` | `redragon_m719_pro-windows-x86.exe` |
+| **Linux** | 64-bit (`x64`) | `x86_64-unknown-linux-gnu` | `redragon_m719_pro-linux-x64` |
+| **Linux** | 32-bit (`x86`) | `i686-unknown-linux-gnu` | `redragon_m719_pro-linux-x86` |
+| **macOS** | 64-bit Intel (`x64`) | `x86_64-apple-darwin` | `redragon_m719_pro-macos-x64` |
+| **macOS** | Apple Silicon (`arm64`) | `aarch64-apple-darwin` | `redragon_m719_pro-macos-arm64` |
 
-2. **Visual Studio C++ Build Tools:**
-   Ensure the MSVC C++ toolset is available (Visual Studio 2019/2022/2026 Build Tools with Windows 10/11 SDK).
+### Automated Release Scripts
+
+- **Windows (PowerShell):** Builds both `x64` and `x86` executables into `dist/`:
+  ```powershell
+  .\build-release.ps1
+  ```
+
+- **Linux & macOS (Bash):** Builds platform binaries into `dist/`:
+  ```bash
+  chmod +x build-release.sh
+  ./build-release.sh
+  ```
+
+- **GitHub Actions CI/CD:** `.github/workflows/build.yml` automatically builds and uploads all 6 targets across Windows, Ubuntu, and macOS runners.
+
+### Linux USB HID Permissions (`udev`)
+
+On Linux, install the included `udev` rule so non-root users can access the mouse USB HID feature endpoints (`0x25A7:0xFA7E` and `0x25A7:0xFAB0`):
+
+```bash
+sudo cp 99-redragon-m719-pro.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
 
 ---
 
-## Build Instructions
+## Standard Cargo Build Instructions
 
-Clone the repository and compile the release binary:
+Clone the repository and compile the native release binary:
 
 ```powershell
 git clone https://github.com/devyat009/redragon-m719-pro.git
 cd redragon-m719-pro
-cargo build --release
-```
-
-The optimized binary with Windows subsystem enabled (`windows_subsystem = "windows"`, running without a console window) will be located at:
-
-```
-target/release/redragon_m719_pro.exe
+cargo build --release --bin redragon_m719_pro
 ```
 
 ---
